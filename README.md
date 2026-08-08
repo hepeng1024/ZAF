@@ -1,76 +1,87 @@
-# FCC Zone-Axis Finder
+# ZAF
 
-This project provides a Python/Tkinter GUI for indexing FCC TEM diffraction
-patterns, predicting reachable zone axes on a double-tilt holder, and exploring
-sample rotation, tilt, pole-figure, crystal, reciprocal-lattice, and diffraction
-simulations.
+ZAF is a Python/Tkinter zone-axis finder for FCC, BCC, and HCP TEM
+diffraction patterns. It detects diffraction spots, matches them against
+structure-specific analytic reference patterns, predicts reachable zone axes
+for a double-tilt holder, and includes sample-rotation, tilt, pole-figure,
+crystal-lattice, reciprocal-lattice, and diffraction simulators.
 
-## 1. Install Anaconda or Miniconda
+The start screen provides separate FCC, BCC, and HCP analysis modes. FCC and
+BCC use their respective systematic reflection conditions. HCP uses a
+hexagonal direct/reciprocal basis, its two-atom basis reflection condition, and
+a configurable c/a ratio.
 
-Install one of the following:
+## Installation
 
-- Anaconda: https://www.anaconda.com/download
-- Miniconda: https://docs.conda.io/projects/miniconda/
-
-After installation, open a terminal. On Windows, use **Anaconda Prompt** or a
-terminal where `conda` is available.
-
-## 2. Clone or Download This Project
-
-Using Git:
+Install [Anaconda](https://www.anaconda.com/download) or
+[Miniconda](https://docs.conda.io/projects/miniconda/), then clone or download
+the project:
 
 ```bash
-git clone https://github.com/hepeng1024/zone_axis_finder
-cd zone_axis_finder
-```
-
-Or download the project ZIP from GitHub, unzip it, and open a terminal inside
-the extracted `zone_axis_finder` folder.
-
-## 3. Create the Environment
-
-The required Python packages are listed in `environment.yml`.
-
-```bash
+git clone https://github.com/hepeng1024/ZAF
+cd ZAF
 conda env create -f environment.yml
+conda activate zaf
 ```
 
-This creates a conda environment named `find-zone-axis`.
-
-If the environment already exists and you want to update it:
+To update an existing environment:
 
 ```bash
 conda env update -f environment.yml --prune
 ```
 
-## 4. Activate the Environment
+## Run the GUI
 
 ```bash
-conda activate find-zone-axis
+python ZAF_gui.py
 ```
 
-## 5. Run the GUI
+Select FCC, BCC, or HCP on the landing page, choose a diffraction image, enter
+the current holder alpha/beta angles, and click **Run Analysis**. Use
+**Crystal Selection** in the analysis window to return to the landing page.
 
-From inside the project folder, run:
+For HCP, the indexing panel includes:
+
+- four-index Miller–Bravais directions by default, with a toggle for the
+  internal three-index representation;
+- a c/a entry (the default is the ideal value, about 1.633);
+- three-index input such as `[1 0 0]`, or four-index Miller–Bravais input
+  such as `[2-1-10]` when four-index mode is enabled.
+
+FCC and BCC use the 26 primitive three-index families with nonnegative h, k,
+l and h+k+l ≤ 8. HCP instead uses this nonduplicated four-index catalog:
+`<0001>`, `<2-1-10>`, `<10-10>`, `<10-11>`, `<10-12>`, `<11-23>`,
+`<21-30>`, and `<40-43>`.
+
+## Command line
+
+The core program can also be run directly:
 
 ```bash
-python zone_axis_finder_gui.py
+python ZAF.py IMAGE --alpha 0 --beta 0 --crystal-structure FCC
+python ZAF.py IMAGE --alpha 0 --beta 0 --crystal-structure BCC
+python ZAF.py IMAGE --alpha 0 --beta 0 --crystal-structure HCP \
+  --hcp-c-over-a 1.633 --current-zone "2-1-10"
 ```
 
-The GUI will open as **FCC Zone-Axis Finder**. Choose an experimental diffraction
-image, enter the current holder alpha/beta angles, adjust the options as needed,
-and click **Run Analysis**.
+Run `python ZAF.py --help` for all matching, calibration, holder, map, and
+export options.
 
-## Project Files
+## Scale-bar calibration
 
-- `zone_axis_finder_gui.py`: main graphical interface.
-- `zone_axis_finder.py`: core indexing, matching, plotting, and tilt calculations.
-- `environment.yml`: conda environment definition.
-- `assets/`: artwork used by the GUI.
+ZAF can detect the bright horizontal scale-bar line and measure its pixel
+length. The printed reciprocal-space value (for example, 5 nm⁻¹) still needs
+to be entered because that physical value is not reliably encoded in the
+line itself. Supplying an expected lattice parameter lets ZAF use this
+calibration to help rank otherwise ambiguous candidate zones.
 
-## Notes
+## Project files
 
-- Keep the `assets/` folder in the same folder as `zone_axis_finder_gui.py`.
-- The default conda environment name is `find-zone-axis`.
-- If Tkinter does not open correctly, make sure you created the environment from
-  `environment.yml` and activated it before running the GUI.
+- `ZAF_gui.py`: graphical interface, landing page, and simulators.
+- `ZAF.py`: indexing, crystal geometry, matching, plotting, and tilt math.
+- `environment.yml`: Conda environment definition (`zaf`).
+- `assets/`: GUI artwork, including the FCC/BCC/HCP landing images.
+- `tests/`: regression and crystal-structure tests.
+
+Keep the `assets/` folder beside `ZAF_gui.py`. If Tkinter does not open,
+recreate or update the `zaf` environment from `environment.yml`.
