@@ -1,4 +1,4 @@
-name: find-zone-axis
+name: zaf
 channels:
   - conda-forge
   - defaults
