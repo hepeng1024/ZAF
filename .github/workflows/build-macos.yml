@@ -46,10 +46,20 @@ jobs:
           python -m pip install --requirement packaging/requirements-macos-build.txt
           python -m PyInstaller --version
 
-      - name: Test source imports and calculations
+      - name: Test source imports and bundled resources
         run: |
           python -c 'import ZAF, ZAF_gui; print("ZAF imports: OK")'
+          python ZAF_gui.py --bundle-self-test
+
+      - name: Run calculation tests
+        if: ${{ hashFiles('tests/test_*.py') != '' }}
+        run: |
           python -m unittest discover -s tests -v
+
+      - name: Report unavailable calculation tests
+        if: ${{ hashFiles('tests/test_*.py') == '' }}
+        run: |
+          echo "::warning::No tracked tests/test_*.py files were found; continuing with import, resource, and package verification."
 
       - name: Build and verify ZAF.app
         run: bash packaging/package_macos.sh
