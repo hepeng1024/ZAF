@@ -198,44 +198,138 @@ an Apple Developer identity, hardened-runtime signing, and notarization.
 
 ## Windows x86_64 Package
 
-ZAF does not yet have a repeatable Windows packaging helper equivalent to the
-Linux and macOS scripts. Until one is added, build natively on Windows with the
-same `--onedir` layout.
+The repeatable Windows workflow must run on native 64-bit Windows. PyInstaller
+is not a cross-compiler, so do not run this build in WSL or with a WSL/Linux
+Python interpreter. The scripts explicitly use the native Conda environment
+named `zaf`; they do not depend on the environment that launched VS Code or the
+current PowerShell session.
 
-From PowerShell in the repository root:
+Create the environment if it does not exist:
 
 ```powershell
 conda env create -f environment.yml
-conda activate zaf
-
-python -m PyInstaller `
-  --onedir `
-  --windowed `
-  --clean `
-  --noconfirm `
-  --name ZAF `
-  --icon "assets\ZAF.ico" `
-  --add-data "assets;assets" `
-  --add-data "ZAF_instrument_settings.txt;." `
-  --collect-data matplotlib `
-  --hidden-import matplotlib.backends.backend_tkagg `
-  --hidden-import PIL._tkinter_finder `
-  --exclude-module pytest `
-  --exclude-module tests `
-  ZAF_gui.py
-
-Copy-Item ZAF_instrument_settings.txt dist\ZAF\ZAF_instrument_settings.txt
+conda run -n zaf python -m pip install PyInstaller
 ```
 
-Test `dist\ZAF\ZAF.exe` on Windows, including all assets, analysis, simulators,
-downloads, and the invalid/missing-settings fallback. Distribute the complete
-`dist\ZAF\` folder, not only `ZAF.exe`.
-
-Create a release ZIP after testing:
+For an existing environment, update it and make sure PyInstaller is installed
+inside `zaf`, not in `base` or globally:
 
 ```powershell
-Compress-Archive -Path dist\ZAF -DestinationPath ZAF-Windows-x86_64.zip
+conda env update -n zaf -f environment.yml --prune
+conda run -n zaf python -m pip install --upgrade PyInstaller
 ```
+
+Verify the interpreter before packaging:
+
+```powershell
+conda run -n zaf python -c "import os, sys; print(sys.executable); print(sys.platform); print(os.environ.get('CONDA_DEFAULT_ENV'))"
+conda run -n zaf python -m PyInstaller --version
+```
+
+The first command must report a native Windows interpreter under the `zaf`
+environment, `win32`, and `zaf`. A parent shell may still report that `base` is
+active; that is harmless because every Python command in the workflow is
+executed through `conda run -n zaf`.
+
+Build, verify, smoke-test, and archive the application from PowerShell in the
+repository root:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\packaging\windows\package_windows.ps1
+```
+
+The script validates the source inputs, icon, runtime assets, imports, and
+instrument settings before building. It runs the available project tests and
+the source self-tests, then invokes the environment-specific PyInstaller as
+equivalent to:
+
+```powershell
+conda run -n zaf python -m PyInstaller `
+  --noconfirm `
+  --clean `
+  --onedir `
+  --windowed `
+  --noupx `
+  --name ZAF `
+  --icon <repository>\assets\ZAF.ico `
+  --add-data "<repository>\assets;assets" `
+  --add-data "<repository>\ZAF_instrument_settings.txt;." `
+  ZAF_gui.py
+```
+
+`ZAF_gui.py` is the only entry script. PyInstaller discovers the imported
+`ZAF.py` backend and uses its maintained hooks for NumPy, SciPy, Pillow,
+Matplotlib, and Tkinter. Do not add broad hidden imports or manually copied DLLs
+unless a clean build and bundle test demonstrate a specific missing component.
+
+The two settings-file copies serve different purposes:
+
+```text
+ZAF-Windows-x86_64/ZAF_instrument_settings.txt
+    Editable file read by the frozen GUI at startup.
+
+ZAF-Windows-x86_64/_internal/ZAF_instrument_settings.txt
+    Bundled template used by the noninteractive bundle self-test.
+```
+
+PyInstaller creates the internal copy through `--add-data`. The packaging
+script then copies the repository template beside `ZAF.exe` as an ordinary,
+writable file. Both copies must initially match, but the external copy remains
+independently editable by the user.
+
+Generated outputs are separated under:
+
+```text
+build_work/windows/work/
+build_work/windows/spec/
+build_work/windows/staging/
+dist/windows/ZAF/
+release/ZAF-Windows-x86_64/
+release/ZAF-Windows-x86_64.zip
+```
+
+Only those ZAF-specific generated paths are cleaned. The release ZIP has one
+top-level folder containing approximately:
+
+```text
+ZAF-Windows-x86_64/
+|-- ZAF.exe
+|-- ZAF_instrument_settings.txt
+|-- README_WINDOWS.txt
+`-- _internal/
+    |-- ZAF_instrument_settings.txt
+    |-- assets/
+    `-- bundled Python libraries, Tcl/Tk files, .pyd modules, and DLLs
+```
+
+Distribute the complete folder or ZIP, never `ZAF.exe` alone. The executable
+requires `_internal`, and the editable settings file must remain beside it.
+
+The packaging script calls `packaging/windows/verify_windows_bundle.ps1`
+before creating the archive, after creating it, and again after extracting it
+to a disposable path containing spaces. It checks the PE32+ x86_64 GUI
+executable and embedded icon, assets, backend module, scientific libraries,
+Tcl/Tk runtime, internal and external settings copies, development-file
+exclusions, complete ZIP contents, `--bundle-self-test`, and
+`--gui-smoke-test`. It also exercises edited, missing, and invalid external
+settings in the disposable extracted copy and restores the default afterward.
+
+Verify an existing release directory and archive manually with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\packaging\windows\verify_windows_bundle.ps1 `
+  -BundlePath .\release\ZAF-Windows-x86_64 `
+  -ArchivePath .\release\ZAF-Windows-x86_64.zip
+```
+
+Before publishing, manually open the freshly extracted application and test
+the FCC, BCC, and HCP modes, analysis and preview images, both simulators,
+saved output, window resizing, and edited instrument defaults. Test on another
+Windows computer when practical. The executable is currently unsigned, so a
+SmartScreen reputation warning is possible; do not disable Windows security
+protections, and distinguish such a warning from an actual malware detection.
 
 ## Release Checklist
 
