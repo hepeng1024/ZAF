@@ -1,13 +1,16 @@
-name: Build ZAF for macOS Apple Silicon
+name: Build macOS ZAF
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
 
 jobs:
-  build-macos-arm64:
+  build-macos:
     name: Build macOS ARM64 app
     runs-on: macos-15
     timeout-minutes: 45
@@ -33,6 +36,9 @@ jobs:
           test "$(uname -m)" = "arm64"
           test "$(python -c 'import platform; print(platform.machine())')" = "arm64"
           python --version
+
+      - name: Check packaging inputs
+        run: bash packaging/package_macos.sh --check-only
 
       - name: Install runtime and build dependencies
         run: |
