@@ -1,0 +1,31 @@
+# ZAF TEM instrument defaults
+# ===========================
+#
+# ZAF reads this file once when the GUI starts. Edit only the numeric values
+# after the equals signs, save the file, and restart ZAF.
+#
+# All tilt and rotation values are in degrees.
+#
+# alpha_min / alpha_max
+#   Minimum and maximum alpha tilt supported by the TEM holder.
+#
+# beta_min / beta_max
+#   Minimum and maximum beta tilt supported by the TEM holder.
+#
+# image_to_holder_rotation_deg
+#   In-plane rotation from the diffraction image +X direction to the holder
+#   +X direction. The default value for the original TEM calibration is 90.
+#
+# Requirements:
+#   - Keep all five setting names below, with one setting per line.
+#   - Use ordinary finite numbers (for example: -35, 20, or 90.0).
+#   - alpha_min must be smaller than alpha_max.
+#   - beta_min must be smaller than beta_max.
+#   - Lines beginning with # and blank lines are ignored.
+#   - Holder order is intentionally not configured here; ZAF uses xy.
+
+alpha_min = -35
+alpha_max = 35
+beta_min = -20
+beta_max = 20
+image_to_holder_rotation_deg = 90

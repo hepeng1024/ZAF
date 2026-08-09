@@ -62,12 +62,113 @@ except ImportError as exc:  # pragma: no cover - depends on local environment.
 
 APP_DIR = Path(__file__).resolve().parent
 ASSET_DIR = APP_DIR / "assets"
+INSTRUMENT_SETTINGS_FILENAME = "ZAF_instrument_settings.txt"
+BUNDLED_INSTRUMENT_SETTINGS_PATH = APP_DIR / INSTRUMENT_SETTINGS_FILENAME
+DEFAULT_INSTRUMENT_SETTINGS = {
+    "alpha_min": -35.0,
+    "alpha_max": 35.0,
+    "beta_min": -20.0,
+    "beta_max": 20.0,
+    "image_to_holder_rotation_deg": 90.0,
+}
 DEFAULT_SELECTED_TARGET_FAMILIES = frozenset(("100", "110", "111"))
 DEFAULT_SELECTED_HCP_TARGET_FAMILIES = frozenset(("0001", "2-1-10", "10-10"))
+RUNTIME_ASSET_FILENAMES = (
+    "BCC.png",
+    "FCC.png",
+    "HCP.png",
+    "Negative alpha tilt arrow.png",
+    "Negative beta tilt arrow.png",
+    "Positive alpha tilt arrow.png",
+    "Positive beta tilt arrow.png",
+    "Sample holder object.png",
+    "TEM lamella object.png",
+    "Schematic of the double-tilt holder and the zone-axis of the sample.png",
+    "Schematic of the effect of sample rotation.png",
+)
 
 
 def asset_path(filename: str) -> Path:
     return ASSET_DIR / filename
+
+
+def instrument_settings_path() -> Path:
+    """Return the editable settings file shipped beside the installed app."""
+    if not getattr(sys, "frozen", False):
+        return BUNDLED_INSTRUMENT_SETTINGS_PATH
+
+    executable = Path(sys.executable).resolve()
+    if sys.platform == "darwin":
+        for parent in executable.parents:
+            if parent.suffix.casefold() == ".app":
+                return parent.parent / INSTRUMENT_SETTINGS_FILENAME
+    return executable.parent / INSTRUMENT_SETTINGS_FILENAME
+
+
+def parse_instrument_settings(text: str) -> dict[str, float]:
+    """Parse and validate the small, human-editable instrument settings file."""
+    values: dict[str, float] = {}
+    allowed = set(DEFAULT_INSTRUMENT_SETTINGS)
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.split("#", 1)[0].strip()
+        if "=" not in line:
+            raise ValueError(
+                f"line {line_number} must use 'setting = number' format"
+            )
+        key, value_text = (part.strip() for part in line.split("=", 1))
+        if key not in allowed:
+            raise ValueError(f"line {line_number} has unknown setting '{key}'")
+        if key in values:
+            raise ValueError(f"line {line_number} repeats setting '{key}'")
+        try:
+            value = float(value_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"line {line_number} has a nonnumeric value for '{key}'"
+            ) from exc
+        if not math.isfinite(value):
+            raise ValueError(f"line {line_number} requires a finite value for '{key}'")
+        values[key] = value
+
+    missing = [key for key in DEFAULT_INSTRUMENT_SETTINGS if key not in values]
+    if missing:
+        raise ValueError("missing required setting(s): " + ", ".join(missing))
+    if values["alpha_min"] >= values["alpha_max"]:
+        raise ValueError("alpha_min must be smaller than alpha_max")
+    if values["beta_min"] >= values["beta_max"]:
+        raise ValueError("beta_min must be smaller than beta_max")
+    return values
+
+
+def load_instrument_settings(path: Path) -> tuple[dict[str, float], str | None]:
+    """Load settings, returning built-in defaults and a user warning on error."""
+    defaults = dict(DEFAULT_INSTRUMENT_SETTINGS)
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return defaults, (
+            f"The instrument settings file is missing:\n{path}\n\n"
+            "ZAF will use its built-in tilt and image-rotation defaults. "
+            f"Restore {INSTRUMENT_SETTINGS_FILENAME} beside the application "
+            "and restart ZAF to use institution-specific values."
+        )
+    except OSError as exc:
+        return defaults, (
+            f"The instrument settings file could not be read:\n{path}\n\n"
+            f"{exc}\n\nZAF will use its built-in defaults."
+        )
+
+    try:
+        return parse_instrument_settings(text), None
+    except ValueError as exc:
+        return defaults, (
+            f"The instrument settings file is invalid:\n{path}\n\n"
+            f"{exc}.\n\nZAF will use its built-in defaults. Fix the file and "
+            "restart ZAF to load the corrected values."
+        )
 
 
 @dataclass
@@ -1526,6 +1627,8 @@ class SampleRotationSimulator(tk.Toplevel):
         self.holder_photo: ImageTk.PhotoImage | None = None
         self.lamella_photo: ImageTk.PhotoImage | None = None
         self.dynamic_map_photo: ImageTk.PhotoImage | None = None
+        self.dynamic_map_image: Image.Image | None = None
+        self._dynamic_map_resize_job: str | None = None
         self.lamella_item: int | None = None
         self.tilt_simulator_window: SampleTiltSimulator | None = None
         self.lamella_center = (self.canvas_size[0] / 2.0, self.canvas_size[1] * 0.38)
@@ -1608,7 +1711,7 @@ class SampleRotationSimulator(tk.Toplevel):
         side = ttk.Frame(self, padding=(0, 12, 12, 12))
         side.grid(row=0, column=1, sticky="nsew")
         side.columnconfigure(0, weight=1)
-        side.rowconfigure(2, weight=1)
+        side.rowconfigure(1, weight=1)
 
         controls = ttk.LabelFrame(side, text="Rotation Control", style="Section.TLabelframe", padding=10)
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -1629,14 +1732,29 @@ class SampleRotationSimulator(tk.Toplevel):
             row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0)
         )
 
-        map_frame = ttk.LabelFrame(side, text="Dynamic Zone Axis Map", style="Section.TLabelframe", padding=8)
-        map_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        map_frame.columnconfigure(0, weight=1)
-        self.dynamic_map_label = ttk.Label(map_frame, anchor="center")
-        self.dynamic_map_label.grid(row=0, column=0, sticky="ew")
+        self.results_panes = ttk.Panedwindow(side, orient="vertical")
+        self.results_panes.grid(row=1, column=0, sticky="nsew")
 
-        summary = ttk.LabelFrame(side, text="Reachable Target Axes", style="Section.TLabelframe", padding=8)
-        summary.grid(row=2, column=0, sticky="nsew")
+        map_frame = ttk.LabelFrame(
+            self.results_panes,
+            text="Dynamic Zone Axis Map",
+            style="Section.TLabelframe",
+            padding=8,
+        )
+        map_frame.columnconfigure(0, weight=1)
+        map_frame.rowconfigure(0, weight=1)
+        self.dynamic_map_label = ttk.Label(map_frame, anchor="center")
+        self.dynamic_map_label.grid(row=0, column=0, sticky="nsew")
+        self.dynamic_map_label.bind(
+            "<Configure>", self._schedule_dynamic_map_resize, add="+"
+        )
+
+        summary = ttk.LabelFrame(
+            self.results_panes,
+            text="Reachable Target Axes",
+            style="Section.TLabelframe",
+            padding=8,
+        )
         summary.columnconfigure(0, weight=1)
         summary.rowconfigure(0, weight=1)
         self.output_text = tk.Text(summary, wrap="none", width=58, height=self.output_text_height)
@@ -1646,6 +1764,48 @@ class SampleRotationSimulator(tk.Toplevel):
         self.output_text.grid(row=0, column=0, sticky="nsew")
         y_scroll.grid(row=0, column=1, sticky="ns")
         x_scroll.grid(row=1, column=0, sticky="ew")
+
+        self.results_panes.add(map_frame, weight=3)
+        self.results_panes.add(summary, weight=1)
+        self.after_idle(self._set_initial_results_pane_sizes)
+
+    def _set_initial_results_pane_sizes(self) -> None:
+        """Start map-heavy while leaving a useful, draggable text pane."""
+        with contextlib.suppress(tk.TclError):
+            self.update_idletasks()
+            total_height = self.results_panes.winfo_height()
+            if total_height <= 1:
+                self.after(50, self._set_initial_results_pane_sizes)
+                return
+            summary_height = max(130, min(240, round(total_height * 0.26)))
+            self.results_panes.sashpos(0, max(180, total_height - summary_height))
+
+    def _schedule_dynamic_map_resize(self, _event: tk.Event | None = None) -> None:
+        if self._dynamic_map_resize_job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.after_cancel(self._dynamic_map_resize_job)
+        self._dynamic_map_resize_job = self.after(
+            50, self._render_dynamic_map_photo
+        )
+
+    def _render_dynamic_map_photo(self) -> None:
+        self._dynamic_map_resize_job = None
+        if self.dynamic_map_image is None:
+            return
+        with contextlib.suppress(tk.TclError):
+            max_width = self.dynamic_map_label.winfo_width() - 8
+            max_height = self.dynamic_map_label.winfo_height() - 8
+            if max_width < 24 or max_height < 24:
+                return
+            source = self.dynamic_map_image
+            scale = min(max_width / source.width, max_height / source.height)
+            display_size = (
+                max(1, round(source.width * scale)),
+                max(1, round(source.height * scale)),
+            )
+            display = source.resize(display_size, Image.Resampling.LANCZOS)
+            self.dynamic_map_photo = ImageTk.PhotoImage(display, master=self)
+            self.dynamic_map_label.configure(image=self.dynamic_map_photo)
 
     def _draw_static_holder(self) -> None:
         self.holder_photo = ImageTk.PhotoImage(self.holder_image)
@@ -1724,8 +1884,8 @@ class SampleRotationSimulator(tk.Toplevel):
             image_size=self.map_size,
             title="",
         )
-        self.dynamic_map_photo = ImageTk.PhotoImage(image)
-        self.dynamic_map_label.configure(image=self.dynamic_map_photo)
+        self.dynamic_map_image = image
+        self._render_dynamic_map_photo()
 
     def _mouse_angle(self, event: tk.Event) -> float:
         cx, cy = self.lamella_center
@@ -1839,6 +1999,10 @@ class SampleRotationSimulator(tk.Toplevel):
         self.output_text.see("1.0")
 
     def close(self) -> None:
+        if self._dynamic_map_resize_job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.after_cancel(self._dynamic_map_resize_job)
+            self._dynamic_map_resize_job = None
         self._close_tilt_simulator()
         self.destroy()
 
@@ -1856,6 +2020,9 @@ class ZAFGUI(tk.Tk):
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.fitted_photo: ImageTk.PhotoImage | None = None
         self.zone_map_photo: ImageTk.PhotoImage | None = None
+        self._preview_images: dict[str, Image.Image] = {}
+        self._preview_labels: dict[str, ttk.Label] = {}
+        self._preview_resize_jobs: dict[str, str] = {}
         self.intro_photo: ImageTk.PhotoImage | None = None
         self.intro_rotation_photo: ImageTk.PhotoImage | None = None
         self.landing_photos: dict[str, ImageTk.PhotoImage] = {}
@@ -1869,16 +2036,34 @@ class ZAFGUI(tk.Tk):
         self.bool_vars: dict[str, BooleanVar] = {}
         self.family_vars: dict[str, BooleanVar] = {}
         self.family_checkbuttons: dict[str, ttk.Checkbutton] = {}
+        self.instrument_settings_path = instrument_settings_path()
+        (
+            self.instrument_defaults,
+            self.instrument_settings_warning,
+        ) = load_instrument_settings(self.instrument_settings_path)
 
         self._configure_style()
         self._build_variables()
         self.show_landing()
+        if self.instrument_settings_warning is not None:
+            self.after_idle(
+                lambda warning=self.instrument_settings_warning: messagebox.showwarning(
+                    "Instrument Settings", warning, parent=self
+                )
+            )
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
         if "clam" in style.theme_names():
             style.theme_use("clam")
-        family = tkfont.nametofont("TkDefaultFont").cget("family")
+        default_font = tkfont.nametofont("TkDefaultFont")
+        family = default_font.cget("family")
+        default_size = int(default_font.cget("size"))
+        title_size = default_size + 4 if default_size > 0 else default_size - 4
+        self.analysis_title_font = default_font.copy()
+        self.analysis_title_font.configure(size=title_size, weight="bold")
+        self.analysis_section_font = default_font.copy()
+        self.analysis_section_font.configure(weight="bold")
         # Negative Tk font sizes are pixel sizes. CrysDiS uses them to avoid
         # platform scaling turning large landing-page fonts back into defaults.
         self.landing_title_font = tkfont.Font(
@@ -1890,8 +2075,10 @@ class ZAFGUI(tk.Tk):
         self.landing_button_font = tkfont.Font(
             self, family=family, size=-54, weight="bold"
         )
-        style.configure("Title.TLabel", font=("TkDefaultFont", 14, "bold"))
-        style.configure("Section.TLabelframe.Label", font=("TkDefaultFont", 10, "bold"))
+        style.configure("Title.TLabel", font=self.analysis_title_font)
+        style.configure(
+            "Section.TLabelframe.Label", font=self.analysis_section_font
+        )
         style.configure("LandingTitle.TLabel", font=self.landing_title_font)
         style.configure("LandingSubtitle.TLabel", font=self.landing_subtitle_font)
         style.configure(
@@ -1901,18 +2088,21 @@ class ZAFGUI(tk.Tk):
         )
 
     def _build_variables(self) -> None:
+        instrument = self.instrument_defaults
         defaults = {
             "image": "",
             "alpha": "0",
             "beta": "0",
             "current_zone": "",
             "output_prefix": "",
-            "alpha_min": "-35",
-            "alpha_max": "35",
-            "beta_min": "-20",
-            "beta_max": "20",
+            "alpha_min": f"{instrument['alpha_min']:g}",
+            "alpha_max": f"{instrument['alpha_max']:g}",
+            "beta_min": f"{instrument['beta_min']:g}",
+            "beta_max": f"{instrument['beta_max']:g}",
             "holder_order": "xy",
-            "image_to_holder_rotation_deg": "90",
+            "image_to_holder_rotation_deg": (
+                f"{instrument['image_to_holder_rotation_deg']:g}"
+            ),
             "center_x": "",
             "center_y": "",
             "n_peaks": "120",
@@ -1935,7 +2125,6 @@ class ZAFGUI(tk.Tk):
             "map_show_target_families": BooleanVar(value=True),
             "map_label_individual_color": BooleanVar(value=True),
             "map_reachable_only": BooleanVar(value=True),
-            "show_in_plane_rotation_predictions": BooleanVar(value=False),
             "show_labels": BooleanVar(value=True),
             "show_kikuchi_guides": BooleanVar(value=True),
             "export_target_csv": BooleanVar(value=False),
@@ -1958,10 +2147,19 @@ class ZAFGUI(tk.Tk):
         }
 
     def _set_default_paths(self) -> None:
-        self.input_preview.configure(text="Choose an input diffraction image.", image="")
+        self._set_preview_message(
+            "input",
+            "Choose an input diffraction image.",
+        )
 
     def _clear_root(self) -> None:
         self._close_sample_rotation_simulator()
+        for job in self._preview_resize_jobs.values():
+            with contextlib.suppress(tk.TclError):
+                self.after_cancel(job)
+        self._preview_resize_jobs.clear()
+        self._preview_labels.clear()
+        self._preview_images.clear()
         for child in self.winfo_children():
             child.destroy()
         for column in range(3):
@@ -2079,21 +2277,22 @@ class ZAFGUI(tk.Tk):
             self._load_input_preview(Path(image_text))
 
     def _build_ui(self) -> None:
-        self.columnconfigure(0, weight=0)
-        self.columnconfigure(1, weight=2)
-        self.columnconfigure(2, weight=1)
+        self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(self, padding=12)
-        left.grid(row=0, column=0, sticky="nsew")
+        main_panes = ttk.Panedwindow(self, orient="horizontal")
+        main_panes.grid(row=0, column=0, sticky="nsew")
+
+        left = ttk.Frame(main_panes, width=420, padding=12)
         left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
 
         header = ttk.Frame(left)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         header.columnconfigure(0, weight=1)
         title = ttk.Label(
             header,
-            text=f"{self.crystal_structure} Zone-Axis Finder",
+            text=f"{self.crystal_structure} ZAF",
             style="Title.TLabel",
         )
         title.grid(row=0, column=0, sticky="w")
@@ -2122,14 +2321,12 @@ class ZAFGUI(tk.Tk):
             variable=self.bool_vars["rotate_pattern_180"],
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self.run_button = ttk.Button(button_row, text="Run Analysis", command=self.run_analysis)
-        self.run_button.grid(row=1, column=0, sticky="ew")
-        ttk.Button(button_row, text="Show Command", command=self.show_command).grid(row=1, column=1, padx=(8, 0))
+        self.run_button.grid(row=1, column=0, columnspan=2, sticky="ew")
 
         self.status_var = StringVar(value="Ready")
         ttk.Label(left, textvariable=self.status_var).grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
-        center = ttk.Frame(self, padding=(0, 12, 8, 12))
-        center.grid(row=0, column=1, sticky="nsew")
+        center = ttk.Frame(main_panes, width=720, padding=(8, 12))
         center.columnconfigure(0, weight=1)
         center.rowconfigure(0, weight=1)
 
@@ -2139,10 +2336,10 @@ class ZAFGUI(tk.Tk):
         fitted_frame = ttk.Frame(preview_tabs)
         zone_map_frame = ttk.Frame(preview_tabs)
         simulator_frame = ttk.Frame(preview_tabs)
-        preview_tabs.add(input_frame, text="Input Image")
-        preview_tabs.add(fitted_frame, text="Fitted Diffraction Pattern")
-        preview_tabs.add(zone_map_frame, text="Zone Axis Map")
-        preview_tabs.add(simulator_frame, text="Sample Simulators")
+        preview_tabs.add(input_frame, text="Input")
+        preview_tabs.add(fitted_frame, text="Fitted Pattern")
+        preview_tabs.add(zone_map_frame, text="ZA Map")
+        preview_tabs.add(simulator_frame, text="Simulators")
         input_frame.rowconfigure(0, weight=1)
         input_frame.columnconfigure(0, weight=1)
         fitted_frame.rowconfigure(1, weight=1)
@@ -2151,6 +2348,11 @@ class ZAFGUI(tk.Tk):
         zone_map_frame.columnconfigure(0, weight=1)
         simulator_frame.rowconfigure(0, weight=1)
         simulator_frame.columnconfigure(0, weight=1)
+        # The notebook controls these page sizes. Prevent preview images from
+        # increasing the notebook's requested width when a pane is narrowed.
+        input_frame.grid_propagate(False)
+        fitted_frame.grid_propagate(False)
+        zone_map_frame.grid_propagate(False)
 
         self.input_preview = ttk.Label(input_frame, anchor="center")
         self.input_preview.grid(row=0, column=0, sticky="nsew")
@@ -2161,25 +2363,65 @@ class ZAFGUI(tk.Tk):
         self.zone_map_preview = ttk.Label(zone_map_frame, anchor="center")
         self.zone_map_preview.grid(row=1, column=0, sticky="nsew")
         self._build_simulator_tab(simulator_frame)
+        self._register_preview("input", self.input_preview)
+        self._register_preview("fitted", self.fitted_preview)
+        self._register_preview("map", self.zone_map_preview)
+        self._set_preview_message(
+            "fitted",
+            "Run analysis to generate the fitted diffraction pattern.",
+        )
+        self._set_preview_message(
+            "map",
+            "Run analysis to generate the zone-axis map.",
+        )
 
-        output_col = ttk.Frame(self, padding=(0, 12, 12, 12))
-        output_col.grid(row=0, column=2, sticky="nsew")
+        output_col = ttk.Frame(main_panes, width=390, padding=(8, 12, 12, 12))
         output_col.columnconfigure(0, weight=1)
         output_col.rowconfigure(0, weight=3)
         output_col.rowconfigure(1, weight=2)
 
         output_frame = ttk.LabelFrame(output_col, text="Main Output", style="Section.TLabelframe")
         output_frame.grid(row=0, column=0, sticky="nsew")
-        self.output_text = self._build_output_text(output_frame, width=72, height=18)
+        self.output_text = self._build_output_text(output_frame, width=42, height=18)
 
         more_output_frame = ttk.LabelFrame(output_col, text="More Information", style="Section.TLabelframe")
         more_output_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        self.more_output_text = self._build_output_text(more_output_frame, width=72, height=10)
+        self.more_output_text = self._build_output_text(more_output_frame, width=42, height=10)
+
+        main_panes.add(left, weight=0)
+        main_panes.add(center, weight=1)
+        main_panes.add(output_col, weight=0)
+        self.after_idle(lambda panes=main_panes: self._set_initial_pane_sizes(panes))
+
+    def _set_initial_pane_sizes(self, panes: ttk.Panedwindow) -> None:
+        """Give the preview a useful initial width while keeping panes movable."""
+        with contextlib.suppress(tk.TclError):
+            self.update_idletasks()
+            total_width = panes.winfo_width()
+            if total_width <= 1:
+                self.after(
+                    50,
+                    lambda current=panes: self._set_initial_pane_sizes(current),
+                )
+                return
+            left_width = max(330, min(430, round(total_width * 0.27)))
+            right_width = max(300, min(400, round(total_width * 0.25)))
+            if total_width - left_width - right_width < 460:
+                shortfall = 460 - (total_width - left_width - right_width)
+                left_width = max(300, left_width - (shortfall + 1) // 2)
+                right_width = max(280, right_width - shortfall // 2)
+            panes.sashpos(0, left_width)
+            panes.sashpos(1, total_width - right_width)
 
     def _build_download_bar(self, parent: ttk.Frame, kind: str) -> None:
         bar = ttk.Frame(parent)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         bar.columnconfigure(0, weight=1)
+        heading = {
+            "fitted": "Fitted Diffraction Pattern",
+            "map": "Zone Axis Map",
+        }.get(kind, "Preview")
+        ttk.Label(bar, text=heading).grid(row=0, column=0, sticky="w")
         button = ttk.Button(
             bar,
             text="Download",
@@ -2324,34 +2566,6 @@ class ZAFGUI(tk.Tk):
             text="Show target families only on the map",
             variable=self.bool_vars["map_show_target_families"],
         ).grid(row=option_row + 1, column=0, columnspan=family_columns, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
-            targets,
-            text="Show in-plane rotation predictions",
-            variable=self.bool_vars["show_in_plane_rotation_predictions"],
-        ).grid(row=option_row + 2, column=0, columnspan=family_columns, sticky="w", pady=(6, 0))
-        row += 1
-
-        output = ttk.LabelFrame(parent, text="Output", style="Section.TLabelframe", padding=10)
-        output.grid(row=row, column=0, columnspan=3, sticky="ew")
-        output.columnconfigure(1, weight=1)
-        ttk.Label(output, text="Output prefix").grid(row=0, column=0, sticky="w")
-        ttk.Entry(output, textvariable=self.vars["output_prefix"]).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(output, text="Choose", command=self.browse_output_prefix).grid(row=0, column=2, sticky="ew")
-        ttk.Label(output, text="Leave blank to use the input image name. Tabs are generated even when all exports are unchecked.").grid(
-            row=1, column=1, sticky="w", pady=(3, 8)
-        )
-        ttk.Checkbutton(output, text="Target angles CSV", variable=self.bool_vars["export_target_csv"]).grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=2
-        )
-        ttk.Checkbutton(output, text="Indexed spots CSV", variable=self.bool_vars["export_indexed_spots"]).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=2
-        )
-        ttk.Checkbutton(output, text="Predicted zone pattern PNG", variable=self.bool_vars["export_predicted_pattern"]).grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=2
-        )
-        ttk.Checkbutton(output, text="Fitted diffraction pattern PNG", variable=self.bool_vars["export_fitted_pattern"]).grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=2
-        )
 
     def _refresh_hcp_notation(self) -> None:
         four_index = (
@@ -2428,7 +2642,7 @@ class ZAFGUI(tk.Tk):
         self._labeled_entry(matching, "Known lattice nm", "expected_lattice_parameter_nm", 2, 0)
         ttk.Label(
             matching,
-            text="Optional: the scale-bar line is measured automatically; enter its printed value manually.",
+            text="Optional: the scale-bar line is measured automatically;\nenter its printed value manually.",
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
         row += 1
 
@@ -2528,11 +2742,7 @@ class ZAFGUI(tk.Tk):
             "When the lamella is rotated in the holder before loading, the crystal directions rotate within the holder "
             "XY plane. This changes how a target zone-axis direction is split between alpha and beta tilt. A target that "
             "is slightly outside the alpha limit may become reachable after a small loading rotation because some of the "
-            "required tilt is transferred into beta. When Show in-plane rotation predictions is checked, the program reports "
-            "these cases as out-of-limit targets reachable by sample in-plane rotation and marks the range endpoints on the "
-            "Zone Axis Map. The dashed trace between each endpoint pair shows how the required alpha/beta values sweep "
-            "as the sample loading rotation changes. The printed rotation range is counterclockwise when viewed along "
-            "the holder -Z axis, matching the schematic convention. The Sample Simulators tab opens an interactive rotation simulator "
+            "required tilt is transferred into beta. The Simulators tab opens an interactive rotation simulator "
             "that lets you rotate only the TEM lamella object and immediately list which selected target axes are reachable "
             "at that loading angle. Its dynamic map updates the selected zone-axis points at the same time and keeps the alpha/beta "
             "axes and tilt-limit rectangle fixed. The simulator map uses the screen-view convention: positive alpha points "
@@ -2585,11 +2795,6 @@ class ZAFGUI(tk.Tk):
             "above, plus the current zone. If unchecked, the map shows all supported families.\n\n"
             "Show reachable zone axes only: in Map Settings, hides zone-axis points that cannot enter the alpha/beta tilt limits "
             "even after trying in-plane sample rotation. This affects the Zone Axis Map, Dynamic Zone Axis Map, and Dynamic Pole Figure.\n\n"
-            "Show in-plane rotation predictions: if checked, the program reports out-of-limit target axes that can become "
-            "reachable after sample loading rotation and marks their CCW range endpoints as stars on the Zone Axis Map.\n\n"
-            "Output prefix: optional filename prefix for exported files. Leave it blank to use the input image name.\n\n"
-            "Output file checkboxes: choose exactly which CSV/PNG files to export. They are all unchecked by default; "
-            "the image tabs are still generated for viewing.\n\n"
             "Rotate pattern 180 deg: check this after a first run if the 2D diffraction-pattern symmetry appears to have "
             "chosen the opposite real-space indexing direction. The next run keeps the same spot fit but rotates the "
             "in-plane indexing by 180 deg before calculating target alpha/beta angles.",
@@ -2599,9 +2804,12 @@ class ZAFGUI(tk.Tk):
             row,
             "Advanced: Tilt Limits and Calibration",
             "Alpha min/max and Beta min/max: the holder range used to mark target axes as reachable or not reachable. "
-            "For your double-tilt holder the default values are alpha -35 to 35 deg and beta -20 to 20 deg.\n\n"
-            "Holder order: controls the rotation sequence. Use xy for R = Rx(alpha) @ Ry(beta), which is the recommended "
-            "default for many serial double-tilt TEM holders because the beta axis is carried by alpha tilt. Use yx for "
+            f"Their startup values, together with Image to holder deg, are read from:\n{self.instrument_settings_path}\n"
+            "Edit that file and restart ZAF to apply another TEM's defaults. If it is missing or invalid, ZAF shows a "
+            "warning and uses alpha -35 to 35 deg, beta -20 to 20 deg, and image-to-holder 90 deg.\n\n"
+            "Holder order: controls the rotation sequence. ZAF keeps xy as its startup default, R = Rx(alpha) @ Ry(beta), "
+            "and intentionally does not read holder order from the instrument settings file. The yx option remains "
+            "available for unusual calibration cases.\n\n"
             "Image to holder deg: the in-plane rotation from image +x to holder +X. The default is 90 deg for the TEM "
             "you commonly use. This is important because a diffraction pattern can be rotated by the camera. A single "
             "centrosymmetric diffraction pattern cannot determine this instrument calibration by itself.",
@@ -2654,22 +2862,17 @@ class ZAFGUI(tk.Tk):
             row,
             "Outputs",
             "The Main Output box prints the best present-zone match and target alpha/beta angles that are inside the tilt "
-            "limits. When enabled, it also prints out-of-limit target axes that can be recovered by sample in-plane rotation, "
-            "including the useful counterclockwise loading-rotation ranges and the alpha/beta values at each range endpoint. "
-            "The More Information box keeps alternative reference "
-            "scores, remaining out-of-limit target axes, export messages, and notes. The Fitted Diffraction Pattern tab overlays the fitted predicted spots, optional labels, and optional "
-            "Kikuchi guide lines on top of the experimental diffraction image. The Zone Axis Map tab plots alpha versus beta "
+            "limits. The More Information box keeps alternative reference "
+            "scores, remaining out-of-limit target axes, and notes. The Fitted Pattern tab overlays the fitted predicted spots, optional labels, and optional "
+            "Kikuchi guide lines on top of the experimental diffraction image. The ZA Map tab plots alpha versus beta "
             "for the current zone and predicted zone axes, with dashed lines marking the tilt limits. Point fill color marks "
             "the zone family, while outline color distinguishes individual [uvw] directions within a family. By default, "
             "map label fill follows the family color and the label outline follows the individual [uvw] color; the Map "
-            "Settings checkbox can switch labels to the individual-color fill style. When in-plane predictions are enabled, "
-            "star markers show the CCW range endpoints and dashed traces show the sweep between each min/max pair. "
-            "The Sample Simulators tab opens the interactive lamella rotation simulator after a successful analysis; "
-            "that window includes a separate Open tilt simulator button. Its dynamic map intentionally omits the static "
-            "map's current-zone cross, endpoint stars, and sweep traces. "
+            "Settings checkbox can switch labels to the individual-color fill style. "
+            "The Simulators tab opens the interactive lamella rotation simulator after a successful analysis; "
+            "that window includes a separate Open tilt simulator button. "
             "The generated-image tabs each include a Download button, so you can save one image at a "
-            "time even when the export checkboxes are off. The ideal predicted pattern remains available through the optional PNG export checkbox. The Show Command button "
-            "prints the equivalent terminal command for the current settings.",
+            "time after analysis.",
         )
 
         ttk.Button(content, text="Close", command=window.destroy).grid(row=row, column=0, sticky="e", padx=14, pady=14)
@@ -2699,16 +2902,6 @@ class ZAFGUI(tk.Tk):
         if path:
             self.vars["image"].set(path)
             self._load_input_preview(Path(path))
-
-    def browse_output_prefix(self) -> None:
-        path = filedialog.asksaveasfilename(
-            initialdir=str(APP_DIR),
-            title="Choose output prefix",
-            defaultextension="",
-            filetypes=[("Prefix", "*")],
-        )
-        if path:
-            self.vars["output_prefix"].set(path)
 
     def download_preview_image(self, kind: str) -> None:
         source, suffix, title = self._preview_source_for_kind(kind)
@@ -2770,47 +2963,132 @@ class ZAFGUI(tk.Tk):
         return APP_DIR, f"zone_axis{suffix}"
 
     def _load_input_preview(self, path: Path) -> None:
-        self.preview_photo = self._make_photo(path, (760, 430))
-        if self.preview_photo is None:
-            self.input_preview.configure(text=f"Could not preview:\n{path}", image="")
-            return
-        self.input_preview.configure(image=self.preview_photo, text="")
+        self._set_preview_source(
+            "input",
+            path,
+            f"Could not preview:\n{path}",
+        )
 
     def _load_generated_previews(self, previews: PreviewResult) -> None:
         self._load_preview_target(
-            self.fitted_preview,
-            "fitted_photo",
+            "fitted",
             previews.fitted_image or previews.fitted_path,
             "No fitted diffraction pattern is available.",
         )
         self._load_preview_target(
-            self.zone_map_preview,
-            "zone_map_photo",
+            "map",
             previews.map_image,
             "No zone-axis map is available.",
         )
 
     def _load_preview_target(
         self,
-        label: ttk.Label,
-        photo_attr: str,
+        kind: str,
         source: Image.Image | Path | None,
         empty_text: str,
     ) -> None:
         if source is None:
-            label.configure(text=empty_text, image="")
-            setattr(self, photo_attr, None)
+            self._set_preview_message(kind, empty_text)
             return
-        photo = self._make_photo_from_source(source, (760, 430))
-        if photo is None:
-            label.configure(text=f"Could not preview:\n{source}", image="")
-            setattr(self, photo_attr, None)
-            return
-        setattr(self, photo_attr, photo)
-        label.configure(image=photo, text="")
+        self._set_preview_source(
+            kind,
+            source,
+            f"Could not preview:\n{source}",
+        )
 
-    def _make_photo(self, path: Path, max_size: tuple[int, int]) -> ImageTk.PhotoImage | None:
-        return self._make_photo_from_source(path, max_size)
+    def _register_preview(self, kind: str, label: ttk.Label) -> None:
+        self._preview_labels[kind] = label
+        label.bind(
+            "<Configure>",
+            lambda _event, selected=kind: self._schedule_preview_resize(selected),
+            add="+",
+        )
+
+    def _set_preview_source(
+        self,
+        kind: str,
+        source: Image.Image | Path,
+        error_text: str,
+    ) -> None:
+        try:
+            if isinstance(source, Image.Image):
+                image = source.copy().convert("RGB")
+            else:
+                with Image.open(source) as opened:
+                    image = opened.convert("RGB").copy()
+        except Exception:
+            self._set_preview_message(kind, error_text)
+            return
+
+        self._preview_images[kind] = image
+        label = self._preview_labels.get(kind)
+        if label is not None:
+            label.configure(text="", image="")
+        self._set_preview_photo(kind, None)
+        self._schedule_preview_resize(kind)
+
+    def _set_preview_message(self, kind: str, text: str) -> None:
+        self._preview_images.pop(kind, None)
+        self._set_preview_photo(kind, None)
+        label = self._preview_labels.get(kind)
+        if label is not None:
+            label.configure(text=text, image="")
+
+    def _set_preview_photo(
+        self,
+        kind: str,
+        photo: ImageTk.PhotoImage | None,
+    ) -> None:
+        if kind == "input":
+            self.preview_photo = photo
+        elif kind == "fitted":
+            self.fitted_photo = photo
+        elif kind == "map":
+            self.zone_map_photo = photo
+
+    def _schedule_preview_resize(self, kind: str) -> None:
+        previous = self._preview_resize_jobs.pop(kind, None)
+        if previous is not None:
+            with contextlib.suppress(tk.TclError):
+                self.after_cancel(previous)
+        self._preview_resize_jobs[kind] = self.after(
+            40,
+            lambda selected=kind: self._render_preview(selected),
+        )
+
+    def _render_preview(self, kind: str) -> None:
+        self._preview_resize_jobs.pop(kind, None)
+        source = self._preview_images.get(kind)
+        label = self._preview_labels.get(kind)
+        if source is None or label is None:
+            return
+        try:
+            max_width = label.winfo_width() - 16
+            max_height = label.winfo_height() - 16
+        except tk.TclError:
+            return
+        if max_width < 24 or max_height < 24:
+            return
+
+        image = source.copy()
+        image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image, master=self)
+        self._set_preview_photo(kind, photo)
+        with contextlib.suppress(tk.TclError):
+            label.configure(image=photo, text="")
+
+    def _make_photo(
+        self,
+        path: Path,
+        max_size: tuple[int, int],
+    ) -> ImageTk.PhotoImage | None:
+        try:
+            with Image.open(path) as opened:
+                image = opened.convert("RGB").copy()
+            image.thumbnail(max_size, Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(image, master=self)
+        except Exception:
+            return None
 
     def _make_landing_photo(
         self,
@@ -2867,21 +3145,6 @@ class ZAFGUI(tk.Tk):
                 fill=color,
             )
             return ImageTk.PhotoImage(image, master=self)
-        except Exception:
-            return None
-
-    def _make_photo_from_source(
-        self,
-        source: Image.Image | Path,
-        max_size: tuple[int, int],
-    ) -> ImageTk.PhotoImage | None:
-        try:
-            if isinstance(source, Image.Image):
-                image = source.copy().convert("RGB")
-            else:
-                image = Image.open(source).convert("RGB")
-            image.thumbnail(max_size, Image.Resampling.LANCZOS)
-            return ImageTk.PhotoImage(image)
         except Exception:
             return None
 
@@ -2984,88 +3247,8 @@ class ZAFGUI(tk.Tk):
             "show_labels": self.bool_vars["show_labels"].get(),
             "show_kikuchi_guides": self.bool_vars["show_kikuchi_guides"].get(),
             "kikuchi_max_g_norm": self._float_value("kikuchi_max_g_norm", 0.0),
-            "show_in_plane_rotation_predictions": self.bool_vars["show_in_plane_rotation_predictions"].get(),
             "export_files": self.selected_export_files(),
         }
-
-    def build_argv(self) -> list[str]:
-        settings = self.build_settings()
-        argv = [
-            str(settings["image"]),
-            "--alpha",
-            str(settings["alpha"]),
-            "--beta",
-            str(settings["beta"]),
-            "--crystal-structure",
-            str(settings["crystal_structure"]),
-            "--target-families",
-            *settings["target_families"],  # type: ignore[arg-type]
-        ]
-
-        current_zone = settings["current_zone"]
-        if current_zone is not None:
-            argv.extend(["--current-zone", str(settings["current_zone_text"])])
-
-        if settings["crystal_structure"] == "HCP":
-            argv.extend(["--hcp-c-over-a", str(settings["hcp_c_over_a"])])
-            if settings["hcp_four_index"]:
-                argv.append("--hcp-four-index")
-            else:
-                argv.append("--hcp-three-index")
-
-        alpha_limits = settings["alpha_limits"]
-        beta_limits = settings["beta_limits"]
-        center = settings["center"]
-
-        argv.extend(["--alpha-limits", str(alpha_limits[0]), str(alpha_limits[1])])  # type: ignore[index]
-        argv.extend(["--beta-limits", str(beta_limits[0]), str(beta_limits[1])])  # type: ignore[index]
-        argv.extend(["--holder-order", str(settings["holder_order"])])
-        argv.extend(["--image-to-holder-rotation-deg", str(settings["image_to_holder_rotation_deg"])])
-        if center is not None:
-            argv.extend(["--center", str(center[0]), str(center[1])])  # type: ignore[index]
-        argv.extend(["--n-peaks", str(settings["n_peaks"])])
-        if settings["min_distance_px"] is not None:
-            argv.extend(["--min-distance-px", str(settings["min_distance_px"])])
-        if settings["spot_sigma_px"] is not None:
-            argv.extend(["--spot-sigma-px", str(settings["spot_sigma_px"])])
-        argv.extend(["--peak-percentile", str(settings["peak_percentile"])])
-        argv.extend(["--max-index", str(settings["max_index"])])
-        argv.extend(["--max-g-norm", str(settings["max_g_norm"])])
-        argv.extend(["--tolerance-fraction", str(settings["tolerance_fraction"])])
-        if settings["scale_bar_value_inv_nm"] is not None:
-            argv.extend(
-                [
-                    "--scale-bar-value-inv-nm",
-                    str(settings["scale_bar_value_inv_nm"]),
-                ]
-            )
-        if settings["expected_lattice_parameter_nm"] is not None:
-            argv.extend(
-                [
-                    "--expected-lattice-parameter-nm",
-                    str(settings["expected_lattice_parameter_nm"]),
-                ]
-            )
-        argv.extend(["--kikuchi-max-g-norm", str(settings["kikuchi_max_g_norm"])])
-        if settings["output_prefix"] is not None:
-            argv.extend(["--output-prefix", str(settings["output_prefix"])])
-
-        if settings["include_opposites"]:
-            argv.append("--include-opposites")
-        if settings["invert"]:
-            argv.append("--invert")
-        if settings["rotate_pattern_180"]:
-            argv.append("--rotate-pattern-180")
-        if settings["show_in_plane_rotation_predictions"]:
-            argv.append("--show-in-plane-rotation-predictions")
-        if not settings["show_labels"]:
-            argv.append("--no-labels")
-        if not settings["show_kikuchi_guides"]:
-            argv.append("--no-kikuchi-guides")
-        argv.append("--export-files")
-        argv.extend(settings["export_files"])  # type: ignore[arg-type]
-
-        return argv
 
     def selected_export_files(self) -> list[str]:
         selected: list[str] = []
@@ -3141,27 +3324,11 @@ class ZAFGUI(tk.Tk):
             fitted_path=Path(f"{prefix}_fitted_diffraction_pattern.png") if "fitted_pattern" in settings["export_files"] else None,
         )
 
-    def show_command(self) -> None:
-        try:
-            argv = self.build_argv()
-        except Exception as exc:
-            messagebox.showerror("Cannot Build Command", str(exc))
-            return
-        python_exe = sys.executable
-        command = " ".join([self._quote(python_exe), self._quote(str(APP_DIR / "ZAF.py")), *map(self._quote, argv)])
-        self._write_output(command + "\n")
-
-    def _quote(self, value: str) -> str:
-        if not value or any(ch.isspace() for ch in value):
-            return "'" + value.replace("'", "'\"'\"'") + "'"
-        return value
-
     def run_analysis(self) -> None:
         if self.worker and self.worker.is_alive():
             return
         try:
             settings = self.build_settings()
-            argv = self.build_argv()
         except Exception as exc:
             messagebox.showerror("Input Error", str(exc))
             return
@@ -3178,11 +3345,11 @@ class ZAFGUI(tk.Tk):
         self._close_sample_rotation_simulator()
 
         previews = self.preview_paths_from_settings(settings)
-        self.worker = threading.Thread(target=self._run_worker, args=(settings, argv, previews), daemon=True)
+        self.worker = threading.Thread(target=self._run_worker, args=(settings, previews), daemon=True)
         self.worker.start()
         self.after(100, self._poll_result_queue)
 
-    def _run_worker(self, settings: dict[str, object], argv: list[str], previews: PreviewResult) -> None:
+    def _run_worker(self, settings: dict[str, object], previews: PreviewResult) -> None:
         stream = io.StringIO()
         status = "ok"
         with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
@@ -3261,17 +3428,6 @@ class ZAFGUI(tk.Tk):
             alpha_limits=settings["alpha_limits"],  # type: ignore[arg-type]
             beta_limits=settings["beta_limits"],  # type: ignore[arg-type]
         )
-        sample_rotation_rows = []
-        if settings["show_in_plane_rotation_predictions"]:
-            sample_rotation_rows = ZAF.in_plane_rotation_rows(
-                best,
-                crystal_to_zero_holder,
-                target_families=settings["target_families"],  # type: ignore[arg-type]
-                include_opposites=settings["include_opposites"],  # type: ignore[arg-type]
-                holder_order=settings["holder_order"],  # type: ignore[arg-type]
-                alpha_limits=settings["alpha_limits"],  # type: ignore[arg-type]
-                beta_limits=settings["beta_limits"],  # type: ignore[arg-type]
-            )
         map_families = (
             settings["target_families"]
             if settings["map_show_target_families"]
@@ -3301,7 +3457,6 @@ class ZAFGUI(tk.Tk):
             map_points,
             alpha_limits=settings["alpha_limits"],  # type: ignore[arg-type]
             beta_limits=settings["beta_limits"],  # type: ignore[arg-type]
-            rotation_rows=sample_rotation_rows if settings["show_in_plane_rotation_predictions"] else None,
             map_label_individual_color=settings["map_label_individual_color"],  # type: ignore[arg-type]
         )
 
@@ -3318,8 +3473,6 @@ class ZAFGUI(tk.Tk):
         if settings["rotate_pattern_180"]:
             print("\nApplied correction: fitted pattern indexing rotated by 180 deg.")
         ZAF.print_target_table(rows)
-        if settings["show_in_plane_rotation_predictions"]:
-            ZAF.print_in_plane_rotation_table(sample_rotation_rows)
         export_files = set(settings["export_files"])  # type: ignore[arg-type]
         predicted_image: Image.Image | None = None
         if "predicted_pattern" in export_files:
@@ -3482,23 +3635,10 @@ class ZAFGUI(tk.Tk):
 
         target_section = lines[target_idx:post_idx]
         post_lines = self._trim_blank_edges(lines[post_idx:])
-        sample_rotation_section, post_lines = self._extract_named_section(
-            post_lines,
-            "Out-of-limit targets reachable by sample in-plane rotation",
-        )
-        sample_rotation_keys = {
-            key
-            for key in (self._target_row_key(line) for line in sample_rotation_section)
-            if key is not None
-        }
         target_header = target_section[:4]
         target_rows = [line for line in target_section[4:] if line.strip()]
         yes_rows = [line for line in target_rows if line.lstrip().startswith("yes ")]
-        no_rows = [
-            line
-            for line in target_rows
-            if line.lstrip().startswith("no ") and self._target_row_key(line) not in sample_rotation_keys
-        ]
+        no_rows = [line for line in target_rows if line.lstrip().startswith("no ")]
 
         if main_lines and main_lines[-1].strip():
             main_lines.append("")
@@ -3507,11 +3647,6 @@ class ZAFGUI(tk.Tk):
             main_lines.extend(yes_rows)
         else:
             main_lines.append("(No target zone axes are within the tilt limits.)")
-
-        if sample_rotation_section:
-            if main_lines and main_lines[-1].strip():
-                main_lines.append("")
-            main_lines.extend(sample_rotation_section)
 
         if no_rows:
             if more_lines and more_lines[-1].strip():
@@ -3530,25 +3665,6 @@ class ZAFGUI(tk.Tk):
             more_lines.extend(post_lines)
 
         return "\n".join(main_lines).strip() + "\n", "\n".join(more_lines).strip() + ("\n" if more_lines else "")
-
-    def _extract_named_section(self, lines: Sequence[str], heading: str) -> tuple[list[str], list[str]]:
-        section_idx = self._find_line(lines, heading)
-        if section_idx is None:
-            return [], list(lines)
-        section_end = len(lines)
-        for idx in range(section_idx + 1, len(lines)):
-            if not lines[idx].strip():
-                section_end = idx
-                break
-        section = self._trim_blank_edges(lines[section_idx:section_end])
-        remainder = self._trim_blank_edges([*lines[:section_idx], *lines[section_end:]])
-        return section, remainder
-
-    def _target_row_key(self, line: str) -> tuple[str, str] | None:
-        match = re.match(r"^\s*(?:yes|no)\s+(<[^>]+>)\s+(\[[^\]]+\])", line)
-        if match is None:
-            return None
-        return match.group(1), match.group(2)
 
     def _find_line(self, lines: Sequence[str], target: str) -> int | None:
         for idx, line in enumerate(lines):
@@ -3572,9 +3688,78 @@ class ZAFGUI(tk.Tk):
         return list(lines[start:end])
 
 
-def main() -> int:
+def bundle_self_test() -> int:
+    """Check frozen imports and data files without requiring a display server."""
+    import PIL
+    import scipy
+
+    if not BUNDLED_INSTRUMENT_SETTINGS_PATH.is_file():
+        print(
+            "ZAF bundle self-test failed; missing instrument settings template: "
+            f"{BUNDLED_INSTRUMENT_SETTINGS_PATH}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        parse_instrument_settings(
+            BUNDLED_INSTRUMENT_SETTINGS_PATH.read_text(encoding="utf-8-sig")
+        )
+    except (OSError, ValueError) as exc:
+        print(
+            f"ZAF bundle self-test failed; invalid instrument settings template: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    missing_assets = [
+        filename
+        for filename in RUNTIME_ASSET_FILENAMES
+        if not asset_path(filename).is_file()
+    ]
+    if missing_assets:
+        print(
+            "ZAF bundle self-test failed; missing assets: "
+            + ", ".join(missing_assets),
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        for filename in RUNTIME_ASSET_FILENAMES:
+            with Image.open(asset_path(filename)) as image:
+                image.verify()
+        tcl_patchlevel = str(tk.Tcl().eval("info patchlevel"))
+    except Exception as exc:
+        print(f"ZAF bundle self-test failed: {exc}", file=sys.stderr)
+        return 1
+
+    print("ZAF bundle self-test: OK")
+    print(f"  application directory: {APP_DIR}")
+    print(f"  ZAF backend: {Path(ZAF.__file__).resolve()}")
+    print(f"  NumPy: {np.__version__}")
+    print(f"  SciPy: {scipy.__version__}")
+    print(f"  Pillow: {PIL.__version__}")
+    print(f"  Matplotlib: {matplotlib.__version__}")
+    print(f"  Tcl/Tk: {tcl_patchlevel} / {tk.TkVersion}")
+    print(f"  instrument settings template: {BUNDLED_INSTRUMENT_SETTINGS_PATH}")
+    print(f"  runtime PNG assets: {len(RUNTIME_ASSET_FILENAMES)}")
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--bundle-self-test" in args:
+        return bundle_self_test()
+
+    gui_smoke_test = "--gui-smoke-test" in args
     app = ZAFGUI()
+    if gui_smoke_test:
+        app.update_idletasks()
+        app.update()
+        app.after(750, app.destroy)
     app.mainloop()
+    if gui_smoke_test:
+        print("ZAF GUI smoke test: OK")
     return 0
 
 

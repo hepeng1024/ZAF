@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=ZAF
+Comment=TEM Zone-Axis Finder
+Exec=sh -c 'app_dir="$(dirname "$(readlink -f "$1")")"; exec "$app_dir/run_ZAF.sh"' ZAF %k
+Icon=assets/ZAF.png
+Terminal=false
+Categories=Science;Education;
+StartupNotify=true

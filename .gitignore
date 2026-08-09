@@ -15,6 +15,9 @@ ENV/
 build/
 dist/
 *.egg-info/
+packaging/build/
+packaging/release/
+packaging/*.spec
 
 # Jupyter/editor metadata
 .ipynb_checkpoints/
