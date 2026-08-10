@@ -45,16 +45,23 @@ module imported by the GUI and must not be packaged as a second application.
 ## Instrument Settings In Packages
 
 PyInstaller bundles an internal copy of `ZAF_instrument_settings.txt` so the
-template is always part of the application data. Each release also needs an
-editable copy beside the application:
+template is always part of the application data. The runtime location is:
 
 ```text
 Linux/Windows: beside the ZAF executable
-macOS:         beside ZAF.app in the extracted release folder
+macOS:         ~/Library/Application Support/ZAF/ZAF_instrument_settings.txt
 ```
 
-The runtime reads the editable external copy. If it is missing or invalid, the
-GUI warns the user and falls back to its built-in defaults.
+On macOS, ZAF creates the per-user file from the bundled template on first
+launch and preserves it across app upgrades. This is required because an
+unsigned or non-notarized downloaded app may run from a temporary Gatekeeper
+App Translocation path and cannot see a sibling file beside the original
+`ZAF.app`. The macOS release therefore does not include a top-level settings
+copy beside the app; the authoritative template remains bundled internally.
+
+On Linux and Windows, the runtime reads the editable external copy beside the
+executable. If the active file is missing or invalid, the GUI warns the user
+and falls back to its built-in defaults.
 
 ## Linux x86_64 Package
 
@@ -157,7 +164,7 @@ After a successful run, download the `ZAF-macOS-arm64` artifact. It contains:
 ZAF-macOS-arm64.zip
 └── ZAF-macOS-arm64/
     ├── ZAF.app
-    └── ZAF_instrument_settings.txt
+    └── README_MACOS.txt
 ```
 
 The workflow uses a native `macos-15` ARM64 runner and Python 3.11. It checks

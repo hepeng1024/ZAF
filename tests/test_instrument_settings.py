@@ -90,21 +90,48 @@ class InstrumentSettingsTests(unittest.TestCase):
             path, Path(executable).parent / ZAF_gui.INSTRUMENT_SETTINGS_FILENAME
         )
 
-    def test_frozen_macos_settings_file_is_beside_app(self) -> None:
+    def test_frozen_macos_settings_file_uses_application_support(self) -> None:
         executable = (
-            "/Applications/ZAF release/ZAF.app/Contents/MacOS/ZAF"
+            "/private/var/folders/example/AppTranslocation/ABC/d/"
+            "ZAF.app/Contents/MacOS/ZAF"
         )
         with (
             patch.object(ZAF_gui.sys, "frozen", True, create=True),
             patch.object(ZAF_gui.sys, "platform", "darwin"),
             patch.object(ZAF_gui.sys, "executable", executable),
         ):
-            path = ZAF_gui.instrument_settings_path()
+            path = ZAF_gui.instrument_settings_path(Path("/Users/nina"))
         self.assertEqual(
             path,
-            Path("/Applications/ZAF release")
+            Path("/Users/nina/Library/Application Support/ZAF")
             / ZAF_gui.INSTRUMENT_SETTINGS_FILENAME,
         )
+
+    def test_macos_initialization_copies_bundled_template_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp_dir = Path(temp_name)
+            template = temp_dir / "bundle" / ZAF_gui.INSTRUMENT_SETTINGS_FILENAME
+            settings = (
+                temp_dir
+                / "Library"
+                / "Application Support"
+                / "ZAF"
+                / ZAF_gui.INSTRUMENT_SETTINGS_FILENAME
+            )
+            template.parent.mkdir()
+            template.write_text(VALID_SETTINGS, encoding="utf-8")
+
+            warning = ZAF_gui.initialize_instrument_settings(settings, template)
+            self.assertIsNone(warning)
+            self.assertEqual(settings.read_text(encoding="utf-8"), VALID_SETTINGS)
+
+            custom_settings = VALID_SETTINGS.replace(
+                "alpha_min = -40", "alpha_min = -45"
+            )
+            settings.write_text(custom_settings, encoding="utf-8")
+            warning = ZAF_gui.initialize_instrument_settings(settings, template)
+            self.assertIsNone(warning)
+            self.assertEqual(settings.read_text(encoding="utf-8"), custom_settings)
 
 
 if __name__ == "__main__":

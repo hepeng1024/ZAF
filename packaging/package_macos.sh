@@ -7,6 +7,7 @@ APP_NAME="ZAF"
 ENTRY_SCRIPT="$REPO_ROOT/ZAF_gui.py"
 BACKEND_MODULE="$REPO_ROOT/ZAF.py"
 SETTINGS_FILE="$REPO_ROOT/ZAF_instrument_settings.txt"
+MACOS_README="$SCRIPT_DIR/README_MACOS.txt"
 ASSET_DIR="$REPO_ROOT/assets"
 ICON_FILE="$ASSET_DIR/ZAF.icns"
 BUNDLE_IDENTIFIER="edu.umich.hepeng.ZAF"
@@ -36,6 +37,7 @@ check_repository_inputs() {
     require_file "$ENTRY_SCRIPT"
     require_file "$BACKEND_MODULE"
     require_file "$SETTINGS_FILE"
+    require_file "$MACOS_README"
     require_file "$ICON_FILE"
     require_file "$ASSET_DIR/ZAF.png"
     require_file "$ASSET_DIR/FCC.png"
@@ -60,6 +62,7 @@ if [[ "${1:-}" == "--check-only" ]]; then
     printf '  repository: %s\n' "$REPO_ROOT"
     printf '  entry point: %s\n' "$ENTRY_SCRIPT"
     printf '  instrument settings: %s\n' "$SETTINGS_FILE"
+    printf '  macOS readme: %s\n' "$MACOS_README"
     printf '  icon: %s\n' "$ICON_FILE"
     exit 0
 fi
@@ -154,6 +157,8 @@ done
 bundled_settings="$(find "$APP_BUNDLE" -name 'ZAF_instrument_settings.txt' -print -quit)"
 [[ -n "$bundled_settings" && -r "$bundled_settings" ]] \
     || fail "bundled instrument settings template is missing"
+cmp -s "$SETTINGS_FILE" "$bundled_settings" \
+    || fail "bundled instrument settings template differs from the repository file"
 
 if [[ -n "$(find "$APP_BUNDLE" -type d \( -name tests -o -name .git -o -name __pycache__ -o -name .pytest_cache \) -print)" ]]; then
     fail "the app bundle contains repository tests, VCS metadata, or development caches"
@@ -165,7 +170,7 @@ codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
 mkdir -p -- "$RELEASE_DIR"
 ditto "$APP_BUNDLE" "$RELEASE_DIR/${APP_NAME}.app"
-cp "$SETTINGS_FILE" "$RELEASE_DIR/ZAF_instrument_settings.txt"
+cp "$MACOS_README" "$RELEASE_DIR/README_MACOS.txt"
 ditto -c -k --sequesterRsrc --keepParent "$RELEASE_DIR" "$ARCHIVE_PATH"
 [[ -s "$ARCHIVE_PATH" ]] || fail "release ZIP was not created"
 
@@ -179,10 +184,12 @@ EXTRACTED_RELEASE="$VERIFY_DIR/${APP_NAME}-macOS-arm64"
 EXTRACTED_APP="$EXTRACTED_RELEASE/${APP_NAME}.app"
 [[ -x "$EXTRACTED_APP/Contents/MacOS/$APP_NAME" ]] \
     || fail "archive did not preserve the app executable"
-[[ -r "$EXTRACTED_RELEASE/ZAF_instrument_settings.txt" ]] \
-    || fail "archive did not preserve the editable instrument settings file"
-cmp -s "$SETTINGS_FILE" "$EXTRACTED_RELEASE/ZAF_instrument_settings.txt" \
-    || fail "archive changed the instrument settings file"
+[[ -r "$EXTRACTED_RELEASE/README_MACOS.txt" ]] \
+    || fail "archive did not preserve README_MACOS.txt"
+cmp -s "$MACOS_README" "$EXTRACTED_RELEASE/README_MACOS.txt" \
+    || fail "archive changed README_MACOS.txt"
+[[ ! -e "$EXTRACTED_RELEASE/ZAF_instrument_settings.txt" ]] \
+    || fail "archive contains a misleading settings file beside ZAF.app"
 [[ "$(lipo -archs "$EXTRACTED_APP/Contents/MacOS/$APP_NAME")" == "arm64" ]] \
     || fail "archive did not preserve the ARM64 executable"
 codesign --verify --deep --strict --verbose=2 "$EXTRACTED_APP"

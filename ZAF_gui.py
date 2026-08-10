@@ -64,6 +64,7 @@ APP_DIR = Path(__file__).resolve().parent
 ASSET_DIR = APP_DIR / "assets"
 INSTRUMENT_SETTINGS_FILENAME = "ZAF_instrument_settings.txt"
 BUNDLED_INSTRUMENT_SETTINGS_PATH = APP_DIR / INSTRUMENT_SETTINGS_FILENAME
+MACOS_SETTINGS_SUBDIRECTORY = Path("Library") / "Application Support" / "ZAF"
 DEFAULT_INSTRUMENT_SETTINGS = {
     "alpha_min": -35.0,
     "alpha_max": 35.0,
@@ -92,17 +93,43 @@ def asset_path(filename: str) -> Path:
     return ASSET_DIR / filename
 
 
-def instrument_settings_path() -> Path:
-    """Return the editable settings file shipped beside the installed app."""
+def instrument_settings_path(home_dir: Path | None = None) -> Path:
+    """Return the editable settings path for the current installation."""
     if not getattr(sys, "frozen", False):
         return BUNDLED_INSTRUMENT_SETTINGS_PATH
 
     executable = Path(sys.executable).resolve()
     if sys.platform == "darwin":
-        for parent in executable.parents:
-            if parent.suffix.casefold() == ".app":
-                return parent.parent / INSTRUMENT_SETTINGS_FILENAME
+        # Gatekeeper may run a downloaded app from a temporary AppTranslocation
+        # directory.  A sibling file beside the original .app is not visible
+        # there, so use the standard persistent per-user configuration folder.
+        user_home = Path.home() if home_dir is None else Path(home_dir)
+        return (
+            user_home
+            / MACOS_SETTINGS_SUBDIRECTORY
+            / INSTRUMENT_SETTINGS_FILENAME
+        )
     return executable.parent / INSTRUMENT_SETTINGS_FILENAME
+
+
+def initialize_instrument_settings(
+    path: Path,
+    template_path: Path = BUNDLED_INSTRUMENT_SETTINGS_PATH,
+) -> str | None:
+    """Create a missing editable settings file from the bundled template."""
+    if path.exists():
+        return None
+    try:
+        template_text = template_path.read_text(encoding="utf-8-sig")
+        parse_instrument_settings(template_text)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(template_text, encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        return (
+            f"ZAF could not create the instrument settings file:\n{path}\n\n"
+            f"{exc}\n\nZAF will use its built-in defaults."
+        )
+    return None
 
 
 def parse_instrument_settings(text: str) -> dict[str, float]:
@@ -152,8 +179,8 @@ def load_instrument_settings(path: Path) -> tuple[dict[str, float], str | None]:
         return defaults, (
             f"The instrument settings file is missing:\n{path}\n\n"
             "ZAF will use its built-in tilt and image-rotation defaults. "
-            f"Restore {INSTRUMENT_SETTINGS_FILENAME} beside the application "
-            "and restart ZAF to use institution-specific values."
+            "Create or restore the file at the path shown above and restart "
+            "ZAF to use institution-specific values."
         )
     except OSError as exc:
         return defaults, (
@@ -2037,10 +2064,16 @@ class ZAFGUI(tk.Tk):
         self.family_vars: dict[str, BooleanVar] = {}
         self.family_checkbuttons: dict[str, ttk.Checkbutton] = {}
         self.instrument_settings_path = instrument_settings_path()
+        initialization_warning = None
+        if getattr(sys, "frozen", False) and sys.platform == "darwin":
+            initialization_warning = initialize_instrument_settings(
+                self.instrument_settings_path
+            )
         (
             self.instrument_defaults,
-            self.instrument_settings_warning,
+            load_warning,
         ) = load_instrument_settings(self.instrument_settings_path)
+        self.instrument_settings_warning = initialization_warning or load_warning
 
         self._configure_style()
         self._build_variables()

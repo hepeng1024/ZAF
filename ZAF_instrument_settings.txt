@@ -1,8 +1,16 @@
 # ZAF TEM instrument defaults
 # ===========================
 #
-# ZAF reads this file once when the GUI starts. Edit only the numeric values
-# after the equals signs, save the file, and restart ZAF.
+# ZAF reads its active settings file once when the GUI starts. Edit only the
+# numeric values after the equals signs, save the file, and restart ZAF.
+#
+# Packaged macOS app:
+#   On first launch, ZAF copies this template to the translocation-safe path
+#   ~/Library/Application Support/ZAF/ZAF_instrument_settings.txt
+#   Edit that active copy for institution-specific values.
+#
+# Packaged Linux/Windows app or source checkout:
+#   Edit the copy beside the executable or ZAF_gui.py.
 #
 # All tilt and rotation values are in degrees.
 #

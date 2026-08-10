@@ -24,8 +24,9 @@ include a version number. Desktop packages include the Python runtime and do
 not require a separate Python or Conda installation. The available operating
 systems may vary between releases.
 
-Keep the complete extracted folder together. ZAF uses support libraries,
-images, and `ZAF_instrument_settings.txt` stored beside the application.
+Keep the complete extracted folder together. ZAF uses bundled support
+libraries and images. The editable instrument-settings location depends on
+the operating system, as described under **TEM Instrument Defaults** below.
 
 ### Windows
 
@@ -69,12 +70,19 @@ exact filename in the extraction command.
 1. Download the ZAF macOS ARM64 `.zip` asset, normally
    `ZAF-macOS-arm64.zip`.
 2. Unzip the downloaded file and open its `ZAF-macOS-arm64` folder.
-3. Keep `ZAF.app` and `ZAF_instrument_settings.txt` together.
+3. Read `README_MACOS.txt` for the first-launch and instrument-settings notes.
 4. Double-click `ZAF.app`.
 
 The current macOS package is intended for Apple-silicon/ARM64 Macs. Because it
 is not Developer ID signed or notarized, macOS may block the first launch.
 Right-click `ZAF.app`, choose **Open**, and confirm when prompted.
+
+On first launch, the app creates its editable instrument settings at
+`~/Library/Application Support/ZAF/ZAF_instrument_settings.txt`. This per-user
+location is necessary because macOS may run downloaded applications through
+App Translocation. The macOS ZIP intentionally does not place another settings
+file beside `ZAF.app`, because edits to that copy would be unreliable and
+confusing.
 
 ## Run From Source
 
@@ -139,9 +147,21 @@ beta tilt limits, and image-to-holder rotation for a particular TEM. Restart
 ZAF after saving changes. Holder order intentionally remains `xy` and is not
 configured by this file.
 
-For a packaged release, keep the editable settings file beside the `ZAF`
-executable on Linux/Windows or beside `ZAF.app` on macOS. When running from
-source, it stays in the repository root beside `ZAF_gui.py`.
+For packaged Linux and Windows releases, edit the settings file beside the
+`ZAF` executable. When running from source, edit the repository-root copy
+beside `ZAF_gui.py`.
+
+For packaged macOS releases, edit:
+
+```text
+~/Library/Application Support/ZAF/ZAF_instrument_settings.txt
+```
+
+ZAF creates this per-user file from its bundled template on first launch and
+does not overwrite later user changes. In Finder, choose **Go → Go to Folder**
+and enter `~/Library/Application Support/ZAF` to open it. This location remains
+stable when Gatekeeper launches the downloaded app from an App Translocation
+path or when `ZAF.app` is moved.
 
 If the settings file is missing, unreadable, or invalid, ZAF displays a warning
 and uses the built-in defaults: alpha −35° to 35°, beta −20° to 20°, and
