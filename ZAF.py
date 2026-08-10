@@ -61,6 +61,7 @@ AMBIGUITY_RELATIVE_SCORE_GAP = 0.03
 ADAPTIVE_MIN_PEAKS = 240
 ADAPTIVE_MAX_PEAKS = 480
 ADAPTIVE_PEAK_PERCENTILE = 98.5
+LOW_ORDER_COMPLETENESS_WEIGHT = 5.0
 LATTICE_CALIBRATION_RELATIVE_SIGMA = 0.15
 CRYSTAL_STRUCTURES = ("FCC", "BCC", "HCP")
 DEFAULT_HCP_C_OVER_A = math.sqrt(8.0 / 3.0)
@@ -665,6 +666,10 @@ def detect_scale_bar_pixels(path: Path) -> dict[str, float] | None:
     percentile_threshold = float(np.percentile(roi, 99.6))
     thresholds = sorted({250.0, 240.0, 230.0, max(180.0, percentile_threshold)}, reverse=True)
     min_run = max(30, int(width * 0.025))
+    # Some microscope BMP exports contain a solid white padding row at the
+    # image boundary.  It is not a scale bar and, unlike a real annotation,
+    # spans nearly the full detector width.
+    max_run = max(min_run, int(width * 0.9))
     best: tuple[int, int, int, int] | None = None
 
     for threshold in thresholds:
@@ -681,11 +686,11 @@ def detect_scale_bar_pixels(path: Path) -> dict[str, float] | None:
                     previous = x_int
                     continue
                 length = previous - start + 1
-                if length >= min_run and (best is None or length > best[3]):
+                if min_run <= length <= max_run and (best is None or length > best[3]):
                     best = (start, previous, roi_top + y_local, length)
                 start = previous = x_int
             length = previous - start + 1
-            if length >= min_run and (best is None or length > best[3]):
+            if min_run <= length <= max_run and (best is None or length > best[3]):
                 best = (start, previous, roi_top + y_local, length)
         if best is not None:
             break
@@ -850,9 +855,47 @@ def score_transform(
     rms = math.sqrt(float(np.mean(np.square(distances)))) if distances else float("inf")
     matched_count = len(matched)
     visible_count = len(visible_indices)
-    quality = matched_count / visible_count
+    # A diffraction image rarely shows every theoretically allowed reflection:
+    # high-order spots can be below the detector threshold even when they lie
+    # inside the frame.  Dividing by every predicted visible reflection therefore
+    # gives an artificial advantage to sparse reference lattices.  Cap the
+    # denominator at the number of detected observations so candidate densities
+    # are compared using the evidence that is actually available.
+    observable_count = min(visible_count, len(peaks_screen))
+    evidence_coverage = (
+        matched_count / observable_count if observable_count else 0.0
+    )
+    # Retain theoretical completeness only as a small tie-breaker.  This
+    # distinguishes a complete ideal pattern from an exact sub-lattice alias
+    # without letting unobserved weak reflections dominate experimental data.
+    predicted_completeness = matched_count / visible_count
+    # Prefer the primitive indexing of a reciprocal lattice over a harmonic
+    # alias that labels the same spots with doubled (or still higher) indices.
+    # If high-order spots are observed, their visible low-order predecessors
+    # should normally be present as well.  Restrict this term to the first two
+    # reciprocal shells so weak high-order reflections remain optional.
+    low_order_limit = 2.01 * min_shell
+    low_order_visible = [
+        ref_idx
+        for ref_idx in visible_indices
+        if 0.0 < reflections[ref_idx].g_norm <= low_order_limit
+    ]
+    low_order_matched_count = sum(
+        ref_idx in matched for ref_idx in low_order_visible
+    )
+    low_order_completeness = (
+        low_order_matched_count / len(low_order_visible)
+        if low_order_visible
+        else 0.0
+    )
     normalized_rms = rms / tolerance_px if distances else 999.0
-    score = matched_count + 4.0 * quality - 0.25 * normalized_rms
+    score = (
+        matched_count
+        + 4.0 * evidence_coverage
+        + 0.05 * predicted_completeness
+        + LOW_ORDER_COMPLETENESS_WEIGHT * low_order_completeness
+        - 0.25 * normalized_rms
+    )
     return score, matched, visible_indices, rms, tolerance_px
 
 
