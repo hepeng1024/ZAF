@@ -29,6 +29,7 @@ import argparse
 import csv
 import itertools
 import math
+import os
 import re
 import sys
 from dataclasses import dataclass, replace
@@ -1968,15 +1969,72 @@ def draw_circle(draw: ImageDraw.ImageDraw, x: float, y: float, radius: float, co
     draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color, width=width)
 
 
+def _label_font_candidates() -> tuple[Path, ...]:
+    """Return bold TrueType fonts available to source and frozen builds."""
+    candidates: list[Path] = []
+
+    # Matplotlib ships DejaVu Sans with the application on every supported OS.
+    # Prefer it so fitted-pattern labels have consistent pixel sizes on Linux,
+    # Windows, and macOS instead of depending on platform font metrics.
+    try:
+        import matplotlib
+
+        candidates.append(
+            Path(matplotlib.get_data_path())
+            / "fonts"
+            / "ttf"
+            / "DejaVuSans-Bold.ttf"
+        )
+    except Exception:
+        # ZAF.py can also be used as a backend without Matplotlib.  System fonts
+        # and Pillow's scalable default remain available below.
+        pass
+
+    if sys.platform == "win32":
+        windows_dir = Path(os.environ.get("WINDIR", r"C:\Windows"))
+        candidates.extend(
+            (
+                windows_dir / "Fonts" / "arialbd.ttf",
+                windows_dir / "Fonts" / "segoeuib.ttf",
+            )
+        )
+    elif sys.platform == "darwin":
+        candidates.extend(
+            (
+                Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+                Path("/Library/Fonts/Arial Bold.ttf"),
+            )
+        )
+    else:
+        candidates.extend(
+            (
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+                Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
+                Path("/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
+            )
+        )
+
+    return tuple(candidates)
+
+
 def load_label_font(size: int) -> ImageFont.ImageFont:
-    for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    ):
-        if Path(path).exists():
-            return ImageFont.truetype(path, size=size)
-    return ImageFont.load_default()
+    """Load a bold rendered-image font while preserving the requested size."""
+    size = max(1, int(size))
+    for path in _label_font_candidates():
+        if not path.is_file():
+            continue
+        try:
+            return ImageFont.truetype(str(path), size=size)
+        except OSError:
+            continue
+
+    # Pillow 10.1+ provides a scalable embedded Aileron font.  Passing size is
+    # essential: the old unscaled call produced tiny labels on Windows whenever
+    # none of the Linux-only paths above existed.
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # pragma: no cover - compatibility with older Pillow.
+        return ImageFont.load_default()
 
 
 def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> tuple[int, int]:

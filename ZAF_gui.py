@@ -3761,6 +3761,14 @@ def bundle_self_test() -> int:
         for filename in RUNTIME_ASSET_FILENAMES:
             with Image.open(asset_path(filename)) as image:
                 image.verify()
+        rendered_image_font = ZAF.load_label_font(64)
+        font_bbox = rendered_image_font.getbbox("123")
+        font_height = int(font_bbox[3] - font_bbox[1])
+        if font_height < 30:
+            raise RuntimeError(
+                "rendered-image font did not preserve its requested size "
+                f"(64 px requested, {font_height} px measured)"
+            )
         tcl_patchlevel = str(tk.Tcl().eval("info patchlevel"))
     except Exception as exc:
         print(f"ZAF bundle self-test failed: {exc}", file=sys.stderr)
@@ -3774,6 +3782,11 @@ def bundle_self_test() -> int:
     print(f"  Pillow: {PIL.__version__}")
     print(f"  Matplotlib: {matplotlib.__version__}")
     print(f"  Tcl/Tk: {tcl_patchlevel} / {tk.TkVersion}")
+    print(
+        "  rendered-image font: "
+        f"{getattr(rendered_image_font, 'path', 'Pillow embedded font')} "
+        f"({font_height} px measured)"
+    )
     print(f"  instrument settings template: {BUNDLED_INSTRUMENT_SETTINGS_PATH}")
     print(f"  runtime PNG assets: {len(RUNTIME_ASSET_FILENAMES)}")
     return 0
