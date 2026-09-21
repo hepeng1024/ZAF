@@ -28,10 +28,16 @@ Edit only the documented numeric values in ZAF_instrument_settings.txt, save
 the file, and restart ZAF. ZAF preserves this per-user file when the app is
 moved or upgraded.
 
+Custom crystal structures
+-------------------------
+Use Import CIF on ZAF's landing page to add a structure. ZAF stores a copy in
+the same Application Support folder, under `crystals/`, so the original CIF
+does not need to be selected again. Removing a crystal from ZAF's list deletes
+only that saved copy, not your original file.
+
 Why the file is not beside ZAF.app
 ----------------------------------
 macOS Gatekeeper may run a downloaded application from a temporary
 App Translocation path. A settings file beside the original app may then be
 invisible to the running program. The Application Support location avoids
 that problem and prevents edits from being lost during upgrades.
-

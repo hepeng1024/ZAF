@@ -48,7 +48,7 @@ jobs:
 
       - name: Test source imports and bundled resources
         run: |
-          python -c 'import ZAF, ZAF_gui; print("ZAF imports: OK")'
+          python -c 'import pymatgen.io.cif, pymatgen.symmetry.analyzer, spglib, ZAF, ZAF_crystals, ZAF_gui, ZAF_multiphase, ZAF_orientation; print("ZAF imports: OK")'
           python ZAF_gui.py --bundle-self-test
 
       - name: Run calculation tests

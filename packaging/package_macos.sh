@@ -6,6 +6,9 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 APP_NAME="ZAF"
 ENTRY_SCRIPT="$REPO_ROOT/ZAF_gui.py"
 BACKEND_MODULE="$REPO_ROOT/ZAF.py"
+CRYSTAL_MODULE="$REPO_ROOT/ZAF_crystals.py"
+MULTIPHASE_MODULE="$REPO_ROOT/ZAF_multiphase.py"
+ORIENTATION_MODULE="$REPO_ROOT/ZAF_orientation.py"
 SETTINGS_FILE="$REPO_ROOT/ZAF_instrument_settings.txt"
 MACOS_README="$SCRIPT_DIR/README_MACOS.txt"
 ASSET_DIR="$REPO_ROOT/assets"
@@ -36,6 +39,9 @@ require_command() {
 check_repository_inputs() {
     require_file "$ENTRY_SCRIPT"
     require_file "$BACKEND_MODULE"
+    require_file "$CRYSTAL_MODULE"
+    require_file "$MULTIPHASE_MODULE"
+    require_file "$ORIENTATION_MODULE"
     require_file "$SETTINGS_FILE"
     require_file "$MACOS_README"
     require_file "$ICON_FILE"
@@ -43,6 +49,8 @@ check_repository_inputs() {
     require_file "$ASSET_DIR/FCC.png"
     require_file "$ASSET_DIR/BCC.png"
     require_file "$ASSET_DIR/HCP.png"
+    require_file "$ASSET_DIR/Customized_crystal.png"
+    require_file "$ASSET_DIR/Multiphase_icon.png"
     [[ -d "$ASSET_DIR" ]] || fail "asset directory is missing: $ASSET_DIR"
 }
 
@@ -83,7 +91,7 @@ python_arch="$(python -c 'import platform; print(platform.machine())')"
 
 (
     cd "$REPO_ROOT"
-    python -c 'import tkinter as tk; import numpy, scipy, PIL, matplotlib, ZAF, ZAF_gui; tk.Tcl().eval("info patchlevel")'
+    python -c 'import tkinter as tk; import numpy, scipy, PIL, matplotlib, pymatgen.io.cif, pymatgen.symmetry.analyzer, spglib, ZAF, ZAF_crystals, ZAF_gui, ZAF_multiphase, ZAF_orientation; tk.Tcl().eval("info patchlevel")'
     python -m PyInstaller --version
 )
 
@@ -108,6 +116,7 @@ mkdir -p -- "$WORK_DIR" "$SPEC_DIR" "$DIST_DIR" "$RELEASE_ROOT"
         --add-data "$ASSET_DIR:assets" \
         --add-data "$SETTINGS_FILE:." \
         --collect-data matplotlib \
+        --collect-data pymatgen \
         --hidden-import matplotlib.backends.backend_tkagg \
         --hidden-import PIL._tkinter_finder \
         --exclude-module pytest \

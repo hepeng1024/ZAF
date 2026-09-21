@@ -8,5 +8,7 @@ dependencies:
   - scipy
   - matplotlib
   - pillow
+  - pymatgen
+  - spglib
   - tk
   - pyinstaller=6.21.0

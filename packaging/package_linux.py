@@ -21,9 +21,14 @@ APP_NAME = "ZAF"
 ARCHIVE_STEM = "ZAF-Linux-x86_64"
 REQUIRED_PROJECT_PATHS = (
     "ZAF.py",
+    "ZAF_crystals.py",
     "ZAF_gui.py",
+    "ZAF_multiphase.py",
+    "ZAF_orientation.py",
     "ZAF_instrument_settings.txt",
     "assets",
+    "assets/Customized_crystal.png",
+    "assets/Multiphase_icon.png",
     "assets/ZAF.png",
 )
 REQUIRED_IMPORTS = (
@@ -32,8 +37,14 @@ REQUIRED_IMPORTS = (
     "scipy",
     "PIL",
     "matplotlib",
+    "pymatgen.io.cif",
+    "pymatgen.symmetry.analyzer",
+    "spglib",
     "ZAF",
+    "ZAF_crystals",
     "ZAF_gui",
+    "ZAF_multiphase",
+    "ZAF_orientation",
     "PyInstaller",
 )
 
@@ -292,6 +303,8 @@ def main() -> int:
         settings_data,
         "--collect-data",
         "matplotlib",
+        "--collect-data",
+        "pymatgen",
         "--hidden-import",
         "matplotlib.backends.backend_tkagg",
         "--hidden-import",

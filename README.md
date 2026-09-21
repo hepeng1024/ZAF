@@ -1,15 +1,16 @@
 # ZAF
 
-ZAF is a Python/Tkinter zone-axis finder for FCC, BCC, and HCP TEM
-diffraction patterns. It detects diffraction spots, matches them against
-structure-specific analytic reference patterns, predicts reachable zone axes
-for a double-tilt holder, and includes sample-rotation, tilt, pole-figure,
-crystal-lattice, reciprocal-lattice, and diffraction simulators.
+ZAF is a Python/Tkinter zone-axis finder for TEM diffraction patterns. It can
+analyze its built-in FCC, BCC, and HCP structures or a crystal supplied as a
+CIF file. It detects diffraction spots, matches them against calculated
+reference patterns, predicts reachable zone axes for a double-tilt holder,
+and includes sample-rotation, tilt, pole-figure, crystal-lattice,
+reciprocal-lattice, and diffraction simulators.
 
-The start screen provides separate FCC, BCC, and HCP analysis modes. FCC and
-BCC use their respective systematic reflection conditions. HCP uses a
-hexagonal direct/reciprocal basis, its two-atom basis reflection condition, and
-a configurable c/a ratio.
+The start screen provides separate FCC, BCC, and HCP analysis modes plus a
+section for your own CIF structures. FCC and BCC use their respective
+systematic reflection conditions. HCP uses a hexagonal direct/reciprocal
+basis, its two-atom basis reflection condition, and a configurable c/a ratio.
 
 The easiest way to use ZAF is to download the desktop package for your
 operating system from GitHub Releases. Running from source is also supported
@@ -109,9 +110,9 @@ Start the graphical application:
 python ZAF_gui.py
 ```
 
-The source environment contains Tkinter, NumPy, SciPy, Pillow, Matplotlib, and
-the packaging tools used by this project. If the environment already exists,
-update it instead of creating it again.
+The source environment contains Tkinter, NumPy, SciPy, Pillow, Matplotlib,
+pymatgen for CIF import, and the packaging tools used by this project. If the
+environment already exists, update it instead of creating it again.
 
 ## Update A Source Checkout
 
@@ -136,8 +137,79 @@ python ZAF_gui.py
    and sample simulators. Use each image tab's **Download** button to save a
    result.
 
-Use **Crystal Selection** in the analysis window to return to the FCC/BCC/HCP
-landing page.
+Use **Crystal Selection** in the analysis window to return to the landing
+page.
+
+### Your crystal structures
+
+On the landing page, use **Your crystal structures (CIF)** → **Import CIF...**
+to select a `.cif` file. ZAF saves its own copy and opens analysis with that
+structure selected. For a later session, choose it in the saved-crystal list
+and click **Analyze selected**; the original CIF need not be selected again.
+**Remove from list** deletes only ZAF's saved copy, not your original file.
+
+The library is private to the current computer user. Its copied CIF files are
+in `~/.local/share/ZAF/crystals/` on Linux (or under `$XDG_DATA_HOME/ZAF` if
+set), `~/Library/Application Support/ZAF/crystals/` on macOS, and
+`%APPDATA%\ZAF\crystals\` on Windows. It is separate from the editable TEM
+instrument-settings file.
+
+ZAF reads the full CIF cell without converting it to a primitive cell, so
+displayed indices refer to the supplied cell. Hexagonal CIF structures use
+the HCP-style four-index direction notation by default, with a three-index
+toggle; other custom structures use three-index directions. Automatic search
+tests directions with |u|+|v|+|w| ≤ 8 for cubic CIFs, ≤ 6 for tetragonal,
+orthorhombic, and trigonal CIFs, or ≤ 4 for monoclinic and triclinic CIFs.
+Hexagonal CIFs use the eight HCP-style candidate families. To test another
+direction, enter it as the **Known current zone**. This is a finite-candidate,
+kinematic geometry match, not a full dynamical TEM simulation. Atom-site
+occupancies and atomic numbers are used to screen systematic absences through
+an approximate structure-factor phase sum, not to score spot intensities;
+experimental intensities can differ substantially. A CIF must contain a
+readable cell and occupied atom sites. The detailed tilt simulator remains
+available for the built-in structures; the sample-rotation map can be used
+with custom structures.
+
+### Multiphase diffraction
+
+If a diffraction image contains more than one phase, select **two or more**
+built-in or saved-CIF phases in the landing page's **Multiphase diffraction**
+section. Enter the shared image and holder angles, then click **Run Multiphase Analysis**.
+ZAF fits a separate reciprocal lattice to each phase and shows a combined
+image with a different colored ring for each phase, along with individual
+fitted-pattern previews and downloadable images. Rings can overlap where both
+phases explain a spot. The results also list reachable target axes for each
+phase. A match is supporting evidence, not proof that a phase is present or a
+quantitative phase-fraction measurement.
+
+Under **Selected phases**, leave a zone blank to search automatically or enter
+a known zone for that phase. The optional lattice parameter `a` is in nm. If
+the image has a printed scale bar, enter its labeled value in `1/nm` in the
+**Advanced** tab; ZAF measures the line length in pixels. A known lattice
+parameter plus that scale can resolve half-spacing aliases caused by spots
+from another phase. Without a printed bar, a known lattice value can still
+help compare relative spacings when an orientation relationship connects two
+phases with known cell dimensions.
+
+An optional orientation relationship accepts **one or two specific, signed
+parallel direction pairs** between Phase 1 and Phase 2. Relationship 1 is
+required when this option is enabled; Relationship 2 can be blank for both
+phases. One pair can constrain its corresponding zone when one fitted phase is
+on that specified axis, but it cannot determine rotation around that axis or
+predict unrelated zones. ZAF therefore performs one bounded image fit rather
+than searching indefinitely over that free rotation. Two pairs define a full
+three-dimensional variant.
+
+The relationship does not make every member of two families parallel. For the
+D0₂₄ Ni₃Ti example, one complete variant is FCC `[1 1 0]` ∥ Ni₃Ti
+`[2 -1 -1 0]` and FCC `[1 -1 1]` ∥ Ni₃Ti `[0 0 0 1]`. With the supplied CIF,
+that variant maps FCC `[1 0 1]` close to Ni₃Ti `[2 0 -2 3]`, and FCC `[1 0 0]`
+close to Ni₃Ti `[4 -4 0 3]`. Different signed or permuted FCC variants lead
+to different predictions. ZAF reports a warning if two entered pairs are
+geometrically inconsistent or if the diffraction evidence conflicts with an
+orientation-relationship prediction. The multiphase page does not enable the
+single-phase sample simulator; inspect each phase's fitted overlay and target
+table.
 
 ## TEM Instrument Defaults
 
@@ -208,7 +280,8 @@ to help rank otherwise ambiguous candidate zones.
 
 ZAF processes diffraction images locally on the user's computer. It does not
 upload selected images to a server. Saved result images are written only to
-the location selected by the user.
+the location selected by the user. Imported CIFs are also processed locally;
+ZAF retains a per-user copy only when you add one to its crystal list.
 
 ## Developer Documentation
 
@@ -222,6 +295,9 @@ Ordinary users do not need the packaging tools or developer instructions.
 
 - `ZAF_gui.py`: graphical interface, landing page, and simulators.
 - `ZAF.py`: indexing, crystal geometry, matching, plotting, and tilt math.
+- `ZAF_crystals.py`: CIF parsing and the per-user crystal library.
+- `ZAF_multiphase.py`: separate fits, shared overlay, and multiphase predictions.
+- `ZAF_orientation.py`: signed-variant orientation-relationship geometry.
 - `ZAF_instrument_settings.txt`: editable startup TEM tilt/calibration values.
 - `environment.yml`: Conda environment definition (`zaf`).
 - `requirements.txt`: pinned Python runtime dependencies.

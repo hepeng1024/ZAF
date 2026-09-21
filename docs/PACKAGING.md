@@ -22,6 +22,7 @@ Keep these files in the repository for packaging:
 
 ```text
 ZAF.py
+ZAF_crystals.py
 ZAF_gui.py
 ZAF_instrument_settings.txt
 requirements.txt
@@ -39,8 +40,18 @@ Windows: assets/ZAF.ico
 macOS:   assets/ZAF.icns
 ```
 
-`ZAF_gui.py` is the only PyInstaller entry point. `ZAF.py` remains a backend
-module imported by the GUI and must not be packaged as a second application.
+`ZAF_gui.py` is the only PyInstaller entry point. `ZAF.py` and
+`ZAF_crystals.py` remain backend modules imported by the GUI and must not be
+packaged as separate applications. The runtime dependency list includes
+pymatgen and spglib; pymatgen's symmetry and element data files must be
+bundled. The Linux and macOS build scripts use `--collect-data pymatgen` for
+this purpose. They check source imports before building; a newly built frozen
+application should also be tested by importing a representative CIF, not just
+by opening the GUI.
+
+Saved custom crystals are user data, not release inputs. They are original
+CIF copies under each user's ZAF application-data directory and must not be
+copied into a release archive or removed during an upgrade.
 
 ## Instrument Settings In Packages
 
@@ -262,13 +273,18 @@ conda run -n zaf python -m PyInstaller `
   --icon <repository>\assets\ZAF.ico `
   --add-data "<repository>\assets;assets" `
   --add-data "<repository>\ZAF_instrument_settings.txt;." `
+  --collect-data pymatgen `
   ZAF_gui.py
 ```
 
 `ZAF_gui.py` is the only entry script. PyInstaller discovers the imported
-`ZAF.py` backend and uses its maintained hooks for NumPy, SciPy, Pillow,
-Matplotlib, and Tkinter. Do not add broad hidden imports or manually copied DLLs
-unless a clean build and bundle test demonstrate a specific missing component.
+`ZAF.py` and `ZAF_crystals.py` backends and uses its maintained hooks for
+NumPy, SciPy, Pillow, Matplotlib, and Tkinter. The CIF parser's pymatgen and
+spglib imports should be found through normal static analysis; do not add
+broad hidden imports or manually copied DLLs unless a clean build and bundle
+test demonstrate a specific missing component. The Windows packaging scripts
+mentioned here are not present in this checkout, so the command above is
+guidance for restoring that build workflow, not a currently runnable script.
 
 The two settings-file copies serve different purposes:
 
@@ -332,18 +348,20 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 ```
 
 Before publishing, manually open the freshly extracted application and test
-the FCC, BCC, and HCP modes, analysis and preview images, both simulators,
-saved output, window resizing, and edited instrument defaults. Test on another
-Windows computer when practical. The executable is currently unsigned, so a
-SmartScreen reputation warning is possible; do not disable Windows security
-protections, and distinguish such a warning from an actual malware detection.
+the FCC, BCC, and HCP modes, custom CIF import/reselection/deletion, analysis
+and preview images, both simulators, saved output, window resizing, and edited
+instrument defaults. Test on another Windows computer when practical. The
+executable is currently unsigned, so a SmartScreen reputation warning is
+possible; do not disable Windows security protections, and distinguish such a
+warning from an actual malware detection.
 
 ## Release Checklist
 
 1. Update any intended version/tag and user-facing release notes.
 2. Confirm the source GUI starts and the calculation tests pass when present.
 3. Build Windows on Windows, Linux on Linux, and macOS on Apple silicon.
-4. Test FCC, BCC, and HCP landing images and analysis flows.
+4. Test FCC, BCC, and HCP landing images and analysis flows, plus a custom CIF
+   import followed by selection after restarting the app.
 5. Test the fitted pattern, zone-axis map, sample-rotation simulator, tilt
    simulator, image downloads, and editable instrument defaults.
 6. Test each archive after extraction, preferably on a clean machine.

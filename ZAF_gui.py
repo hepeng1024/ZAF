@@ -13,6 +13,7 @@ calculation.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import itertools
@@ -20,12 +21,13 @@ import math
 import queue
 import re
 import sys
+import tempfile
 import threading
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, filedialog, font as tkfont, messagebox
-from typing import Sequence
+from typing import Callable, Sequence
 import tkinter as tk
 from tkinter import ttk
 
@@ -42,8 +44,9 @@ except ImportError as exc:  # pragma: no cover - depends on local environment.
 try:
     import numpy as np
     import ZAF
+    from ZAF_crystals import CrystalLibrary, CrystalModel, from_cif
 except ImportError as exc:  # pragma: no cover - depends on launch directory.
-    raise SystemExit(f"Could not import ZAF.py: {exc}") from exc
+    raise SystemExit(f"Could not import ZAF modules: {exc}") from exc
 
 try:
     import matplotlib
@@ -74,10 +77,24 @@ DEFAULT_INSTRUMENT_SETTINGS = {
 }
 DEFAULT_SELECTED_TARGET_FAMILIES = frozenset(("100", "110", "111"))
 DEFAULT_SELECTED_HCP_TARGET_FAMILIES = frozenset(("0001", "2-1-10", "10-10"))
+LANDING_TITLE_PIXELS = 52
+LANDING_SUBTITLE_PIXELS = 28
+LANDING_BUTTON_PIXELS = 30
+LANDING_CRYSTAL_IMAGE_SIZE = (230, 200)
+LANDING_CARD_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("FCC", "FCC.png", "FCC"),
+    ("BCC", "BCC.png", "BCC"),
+    ("HCP", "HCP.png", "HCP"),
+    ("Customized", "Customized_crystal.png", "custom"),
+    ("Multiphase", "Multiphase_icon.png", "multiphase"),
+)
+MULTIPHASE_OR_PHASE_LABELS = ("Phase 1", "Phase 2")
 RUNTIME_ASSET_FILENAMES = (
     "BCC.png",
+    "Customized_crystal.png",
     "FCC.png",
     "HCP.png",
+    "Multiphase_icon.png",
     "Negative alpha tilt arrow.png",
     "Negative beta tilt arrow.png",
     "Positive alpha tilt arrow.png",
@@ -217,6 +234,7 @@ class AnalysisContext:
     crystal_structure: str
     hcp_c_over_a: float
     hcp_four_index: bool
+    crystal_model: CrystalModel | None = None
 
 
 @dataclass
@@ -227,11 +245,15 @@ class PreviewResult:
     fitted_image: Image.Image | None = None
     map_image: Image.Image | None = None
     analysis_context: AnalysisContext | None = None
+    composite_image: Image.Image | None = None
+    phase_images: dict[str, Image.Image] | None = None
+    phase_labels: dict[str, str] | None = None
 
 
 class ScrollFrame(ttk.Frame):
-    def __init__(self, parent: tk.Widget) -> None:
+    def __init__(self, parent: tk.Widget, *, auto_hide_scrollbar: bool = False) -> None:
         super().__init__(parent)
+        self.auto_hide_scrollbar = auto_hide_scrollbar
         self.canvas = tk.Canvas(self, highlightthickness=0)
         self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.inner = ttk.Frame(self.canvas)
@@ -251,9 +273,22 @@ class ScrollFrame(ttk.Frame):
 
     def _update_scroll_region(self, _event: tk.Event) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._update_scrollbar_visibility()
 
     def _update_window_width(self, event: tk.Event) -> None:
         self.canvas.itemconfigure(self.window_id, width=event.width)
+        self.after_idle(self._update_scrollbar_visibility)
+
+    def _update_scrollbar_visibility(self) -> None:
+        """Hide an optional scrollbar when all content already fits."""
+        if not self.auto_hide_scrollbar:
+            return
+        content_height = self.inner.winfo_reqheight()
+        viewport_height = self.canvas.winfo_height()
+        if viewport_height > 1 and content_height <= viewport_height:
+            self.scrollbar.grid_remove()
+        else:
+            self.scrollbar.grid()
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         if event.num == 4:
@@ -1731,7 +1766,14 @@ class SampleRotationSimulator(tk.Toplevel):
         canvas_footer.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         canvas_footer.columnconfigure(0, weight=1)
         ttk.Label(canvas_footer, textvariable=self.offset_var).grid(row=0, column=0, sticky="w")
-        ttk.Button(canvas_footer, text="Open tilt simulator", command=self.open_tilt_simulator).grid(
+        ttk.Button(
+            canvas_footer,
+            text=(
+                "Tilt simulator (built-ins only)"
+                if self.context.crystal_model is not None else "Open tilt simulator"
+            ),
+            command=self.open_tilt_simulator,
+        ).grid(
             row=0, column=1, sticky="e", padx=(10, 0)
         )
 
@@ -1957,6 +1999,15 @@ class SampleRotationSimulator(tk.Toplevel):
         self._after_angle_change()
 
     def open_tilt_simulator(self) -> None:
+        if self.context.crystal_model is not None:
+            messagebox.showinfo(
+                "Custom Crystal Simulator",
+                "The sample-rotation map and reachable target axes use your CIF structure. "
+                "The detailed tilt/diffraction simulator is currently available only "
+                "for the built-in FCC, BCC, and HCP models.",
+                parent=self,
+            )
+            return
         if self.tilt_simulator_window is not None and self.tilt_simulator_window.winfo_exists():
             self._sync_tilt_simulator()
             self.tilt_simulator_window.lift()
@@ -2041,12 +2092,21 @@ class ZAFGUI(tk.Tk):
         self.geometry("1580x840")
         self.minsize(1240, 700)
         self.crystal_structure = "FCC"
+        self.selected_model: CrystalModel | None = None
+        self.is_multiphase = False
+        self.multiphase_selection: list[tuple[str, str, str, CrystalModel | None]] = []
+        self.crystal_library = CrystalLibrary()
+        self.custom_models: dict[str, CrystalModel] = {}
+        self._custom_family_vars: dict[str, dict[str, BooleanVar]] = {}
+        self._custom_return_to_multiphase = False
+        self._multiphase_return_keys: set[str] = set()
 
         self.result_queue: queue.Queue[tuple[str, str, PreviewResult]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.fitted_photo: ImageTk.PhotoImage | None = None
         self.zone_map_photo: ImageTk.PhotoImage | None = None
+        self.composite_photo: ImageTk.PhotoImage | None = None
         self._preview_images: dict[str, Image.Image] = {}
         self._preview_labels: dict[str, ttk.Label] = {}
         self._preview_resize_jobs: dict[str, str] = {}
@@ -2100,13 +2160,13 @@ class ZAFGUI(tk.Tk):
         # Negative Tk font sizes are pixel sizes. CrysDiS uses them to avoid
         # platform scaling turning large landing-page fonts back into defaults.
         self.landing_title_font = tkfont.Font(
-            self, family=family, size=-88, weight="bold"
+            self, family=family, size=-LANDING_TITLE_PIXELS, weight="bold"
         )
         self.landing_subtitle_font = tkfont.Font(
-            self, family=family, size=-48
+            self, family=family, size=-LANDING_SUBTITLE_PIXELS
         )
         self.landing_button_font = tkfont.Font(
-            self, family=family, size=-54, weight="bold"
+            self, family=family, size=-LANDING_BUTTON_PIXELS, weight="bold"
         )
         style.configure("Title.TLabel", font=self.analysis_title_font)
         style.configure(
@@ -2117,7 +2177,7 @@ class ZAFGUI(tk.Tk):
         style.configure(
             "Landing.TButton",
             font=self.landing_button_font,
-            padding=(32, 16),
+            padding=(18, 8),
         )
 
     def _build_variables(self) -> None:
@@ -2178,6 +2238,7 @@ class ZAFGUI(tk.Tk):
             )
             for family in all_families
         }
+        self._built_in_family_vars = self.family_vars
 
     def _set_default_paths(self) -> None:
         self._set_preview_message(
@@ -2207,107 +2268,745 @@ class ZAFGUI(tk.Tk):
                 "Wait for the current analysis to finish before changing crystal structure.",
             )
             return
+        self.is_multiphase = False
+        self.multiphase_choices = {}
+        self.multiphase_checkbuttons = {}
+        self._custom_return_to_multiphase = False
+        self._multiphase_return_keys.clear()
+        page, first_card_row = self._create_selection_page(
+            "ZAF — Select Analysis Mode",
+            "Zone-Axis Finder",
+            "Choose a crystal structure or analysis workflow.",
+        )
+        for row in (first_card_row, first_card_row + 1):
+            page.rowconfigure(row, weight=1, uniform="landing_card_rows")
+
+        card_positions = (
+            (first_card_row, 0),
+            (first_card_row, 2),
+            (first_card_row, 4),
+            (first_card_row + 1, 1),
+            (first_card_row + 1, 3),
+        )
+        for (label, filename, route), (row, column) in zip(
+            LANDING_CARD_SPECS, card_positions
+        ):
+            if route in ZAF.CRYSTAL_STRUCTURES:
+                command = lambda selected=route: self.show_analysis(selected)
+            elif route == "custom":
+                command = self.show_custom_crystal_selection
+            else:
+                command = self.show_multiphase_selection
+            self._build_landing_card(
+                page, row, column, label, filename, command
+            )
+
+    def _create_selection_page(
+        self,
+        window_title: str,
+        heading: str,
+        subtitle: str,
+        *,
+        show_back_button: bool = False,
+        back_command: Callable[[], None] | None = None,
+        back_label: str = "Back to Main Selection",
+    ) -> tuple[ttk.Frame, int]:
+        """Create the shared header and six-column grid for selection pages."""
         self._clear_root()
-        self.title("ZAF — Select Crystal Structure")
+        self.title(window_title)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        page = ttk.Frame(self, padding=36)
-        page.grid(row=0, column=0, sticky="nsew")
-        for column in range(3):
-            page.columnconfigure(column, weight=1, uniform="crystal")
-        page.rowconfigure(2, weight=1)
+        # Scrolling remains a fallback for unusually small/high-DPI displays,
+        # but the compact default layout hides the scrollbar at 1580 x 840.
+        landing_scroll = ScrollFrame(self, auto_hide_scrollbar=True)
+        landing_scroll.grid(row=0, column=0, sticky="nsew")
+        self._landing_scroll = landing_scroll
+        page = landing_scroll.inner
+        page.configure(padding=18)
+        for column in range(6):
+            page.columnconfigure(column, weight=1, uniform="landing_columns")
 
+        self.landing_photos = {}
         self.landing_text_photos = {}
-        label_color = (
-            ttk.Style(self).lookup("TLabel", "foreground") or "#111111"
-        )
+        heading_row = 1 if show_back_button else 0
+        if show_back_button:
+            ttk.Button(
+                page,
+                text=back_label,
+                command=back_command or self.show_landing,
+            ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
+        label_color = ttk.Style(self).lookup("TLabel", "foreground") or "#111111"
         title_photo = self._make_landing_text_photo(
-            "Zone-Axis Finder", 88, label_color, bold=True
+            heading, LANDING_TITLE_PIXELS, label_color, bold=True
         )
         if title_photo is not None:
             self.landing_text_photos["title"] = title_photo
             title_label = ttk.Label(page, image=title_photo)
         else:
             title_label = ttk.Label(
-                page, text="Zone-Axis Finder", style="LandingTitle.TLabel"
+                page, text=heading, style="LandingTitle.TLabel"
             )
-        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 12))
+        title_label.grid(
+            row=heading_row, column=0, columnspan=6, pady=(0, 4)
+        )
 
         subtitle_photo = self._make_landing_text_photo(
-            "Choose a crystal structure to analyze.",
-            48,
-            label_color,
+            subtitle, LANDING_SUBTITLE_PIXELS, label_color
         )
         if subtitle_photo is not None:
             self.landing_text_photos["subtitle"] = subtitle_photo
             subtitle_label = ttk.Label(page, image=subtitle_photo)
         else:
             subtitle_label = ttk.Label(
-                page,
-                text="Choose a crystal structure to analyze.",
-                style="LandingSubtitle.TLabel",
+                page, text=subtitle, style="LandingSubtitle.TLabel"
             )
-        subtitle_label.grid(row=1, column=0, columnspan=3, pady=(0, 26))
+        subtitle_label.grid(
+            row=heading_row + 1,
+            column=0,
+            columnspan=6,
+            pady=(0, 10),
+        )
+        return page, heading_row + 2
 
-        self.landing_photos = {}
-        for column, structure in enumerate(ZAF.CRYSTAL_STRUCTURES):
-            card = ttk.Frame(page, padding=18)
-            card.grid(row=2, column=column, sticky="nsew", padx=14)
-            card.columnconfigure(0, weight=1)
-            card.rowconfigure(0, weight=1)
-            photo = self._make_landing_photo(
-                asset_path(f"{structure}.png"), (360, 420)
+    def _build_landing_card(
+        self,
+        page: ttk.Frame,
+        row: int,
+        column: int,
+        label: str,
+        filename: str,
+        command: Callable[[], None],
+    ) -> None:
+        """Build one consistently sized icon-and-button landing card."""
+        card = ttk.Frame(page, padding=8)
+        card.grid(
+            row=row,
+            column=column,
+            columnspan=2,
+            sticky="nsew",
+            padx=8,
+            pady=4,
+        )
+        card.columnconfigure(0, weight=1)
+        card.rowconfigure(0, weight=1)
+        photo = self._make_landing_photo(
+            asset_path(filename), LANDING_CRYSTAL_IMAGE_SIZE
+        )
+        if photo is not None:
+            self.landing_photos[label] = photo
+            ttk.Label(card, image=photo, anchor="center").grid(
+                row=0, column=0, sticky="nsew", pady=(0, 8)
             )
-            if photo is not None:
-                self.landing_photos[structure] = photo
-                ttk.Label(card, image=photo, anchor="center").grid(
-                    row=0, column=0, sticky="nsew", pady=(0, 20)
-                )
-            else:
-                ttk.Label(card, text=f"{structure} crystal", anchor="center").grid(
-                    row=0, column=0, sticky="nsew", pady=(0, 20)
-                )
-            button_color = (
-                ttk.Style(self).lookup("TButton", "foreground") or label_color
+        else:
+            ttk.Label(card, text=label, anchor="center").grid(
+                row=0, column=0, sticky="nsew", pady=(0, 8)
             )
-            button_photo = self._make_landing_text_photo(
-                structure,
-                54,
-                button_color,
-                bold=True,
-                xpad=18,
-                ypad=8,
-            )
-            button_options: dict[str, object] = {
-                "text": structure,
-                "command": lambda selected=structure: self.show_analysis(selected),
-                "style": "Landing.TButton",
-            }
-            if button_photo is not None:
-                self.landing_text_photos[f"button_{structure}"] = button_photo
-                button_options["image"] = button_photo
-                button_options["compound"] = "none"
-            ttk.Button(
-                card,
-                **button_options,
-            ).grid(row=1, column=0, sticky="ew", ipady=12)
 
-    def show_analysis(self, crystal_structure: str) -> None:
+        button_color = (
+            ttk.Style(self).lookup("TButton", "foreground") or "#111111"
+        )
+        button_photo = self._make_landing_text_photo(
+            label,
+            LANDING_BUTTON_PIXELS,
+            button_color,
+            bold=True,
+            xpad=12,
+            ypad=4,
+        )
+        button_options: dict[str, object] = {
+            "text": label,
+            "command": command,
+            "style": "Landing.TButton",
+        }
+        if button_photo is not None:
+            self.landing_text_photos[f"button_{label}"] = button_photo
+            button_options["image"] = button_photo
+            button_options["compound"] = "none"
+        ttk.Button(card, **button_options).grid(
+            row=1, column=0, sticky="ew", ipady=4
+        )
+
+    def show_custom_crystal_selection(
+        self, *, return_to_multiphase: bool = False
+    ) -> None:
+        self.is_multiphase = False
+        self._custom_return_to_multiphase = return_to_multiphase
+        if not return_to_multiphase:
+            self._multiphase_return_keys.clear()
+        self.multiphase_choices = {}
+        self.multiphase_checkbuttons = {}
+        page, content_row = self._create_selection_page(
+            "Customized Crystals — ZAF",
+            "Customized Crystal",
+            (
+                "Choose or import a crystal to add to the multiphase analysis."
+                if return_to_multiphase
+                else "Import a CIF or choose a saved crystal structure."
+            ),
+            show_back_button=True,
+            back_command=(
+                self._return_to_multiphase_selection
+                if return_to_multiphase
+                else self.show_landing
+            ),
+            back_label=(
+                "Back to Multiphase Selection"
+                if return_to_multiphase
+                else "Back to Main Selection"
+            ),
+        )
+        photo = self._make_landing_photo(
+            asset_path("Customized_crystal.png"), LANDING_CRYSTAL_IMAGE_SIZE
+        )
+        if photo is not None:
+            self.landing_photos["Customized"] = photo
+            ttk.Label(page, image=photo, anchor="center").grid(
+                row=content_row,
+                column=2,
+                columnspan=2,
+                pady=(0, 8),
+            )
+
+        custom_box = ttk.LabelFrame(
+            page,
+            text="Your crystal structures (CIF)",
+            style="Section.TLabelframe",
+            padding=10,
+        )
+        custom_box.grid(
+            row=content_row + 1,
+            column=0,
+            columnspan=6,
+            sticky="ew",
+            padx=8,
+            pady=(4, 0),
+        )
+        custom_box.columnconfigure(0, weight=1)
+        self.custom_choice = StringVar(master=self)
+        self.custom_combo = ttk.Combobox(
+            custom_box, textvariable=self.custom_choice, state="readonly"
+        )
+        self.custom_combo.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.custom_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._update_custom_selection_buttons()
+        )
+        self.custom_open_button = ttk.Button(
+            custom_box,
+            text=("Use selected phase" if return_to_multiphase else "Analyze selected"),
+            command=(
+                self._add_selected_custom_to_multiphase
+                if return_to_multiphase
+                else self._open_selected_custom
+            ),
+        )
+        self.custom_open_button.grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(
+            custom_box, text="Import CIF...", command=self._import_custom_cif
+        ).grid(row=0, column=2, padx=(0, 8))
+        self.custom_delete_button = ttk.Button(
+            custom_box, text="Remove from list", command=self._delete_selected_custom
+        )
+        self.custom_delete_button.grid(row=0, column=3)
+        ttk.Label(
+            custom_box,
+            text="Imported CIF files are saved in your user library for future sessions.",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self._refresh_custom_list()
+
+    def show_multiphase_selection(
+        self, *, preselected_keys: set[str] | None = None
+    ) -> None:
+        self.is_multiphase = False
+        self._custom_return_to_multiphase = False
+        self._load_custom_models()
+        page, content_row = self._create_selection_page(
+            "Multiphase Diffraction — ZAF",
+            "Multiphase Diffraction",
+            "Select two or more phases present in the same diffraction image.",
+            show_back_button=True,
+        )
+        photo = self._make_landing_photo(
+            asset_path("Multiphase_icon.png"), LANDING_CRYSTAL_IMAGE_SIZE
+        )
+        if photo is not None:
+            self.landing_photos["Multiphase"] = photo
+            ttk.Label(page, image=photo, anchor="center").grid(
+                row=content_row,
+                column=2,
+                columnspan=2,
+                pady=(0, 8),
+            )
+
+        multi_box = ttk.LabelFrame(
+            page,
+            text="Phases in this diffraction pattern",
+            style="Section.TLabelframe",
+            padding=10,
+        )
+        multi_box.grid(
+            row=content_row + 1,
+            column=0,
+            columnspan=6,
+            sticky="ew",
+            padx=8,
+            pady=(4, 0),
+        )
+        ttk.Label(
+            multi_box,
+            text="Built-in structures and crystals saved from the Customized page are listed below.",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        self.multiphase_choices: dict[str, tuple[str, str, CrystalModel | None, BooleanVar]] = {}
+        self.multiphase_checkbuttons: dict[str, ttk.Checkbutton] = {}
+        candidates = self._multiphase_candidates()
+        selected_keys = set(preselected_keys or ())
+        for index, (key, label, structure, model) in enumerate(candidates):
+            selected = BooleanVar(value=key in selected_keys)
+            self.multiphase_choices[key] = (label, structure, model, selected)
+            choice_button = ttk.Checkbutton(multi_box, text=label, variable=selected)
+            choice_button.grid(
+                row=1 + index // 3, column=index % 3, sticky="w", padx=(0, 14), pady=1
+            )
+            self.multiphase_checkbuttons[key] = choice_button
+        start_row = 1 + (len(candidates) + 2) // 3
+        ttk.Button(
+            multi_box,
+            text="Manage / Import CIF Structures",
+            command=self._open_custom_crystal_manager_for_multiphase,
+        ).grid(row=start_row, column=0, sticky="ew", pady=(6, 0), padx=(0, 8))
+        ttk.Button(
+            multi_box, text="Analyze selected phases", command=self.show_multiphase_analysis
+        ).grid(
+            row=start_row,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            pady=(6, 0),
+        )
+
+    def _open_custom_crystal_manager_for_multiphase(self) -> None:
+        self._multiphase_return_keys = {
+            key
+            for key, (_label, _structure, _model, selected) in self.multiphase_choices.items()
+            if selected.get()
+        }
+        self.show_custom_crystal_selection(return_to_multiphase=True)
+
+    def _return_to_multiphase_selection(self) -> None:
+        self.show_multiphase_selection(
+            preselected_keys=set(self._multiphase_return_keys)
+        )
+
+    def _add_selected_custom_to_multiphase(self) -> None:
+        model = self.custom_models.get(self.custom_choice.get())
+        if model is None:
+            return
+        self._multiphase_return_keys.add(f"custom:{model.cif_path}")
+        self._return_to_multiphase_selection()
+
+    def show_multiphase_analysis(self) -> None:
+        selected = [
+            (key, label, structure, model)
+            for key, (label, structure, model, variable) in self.multiphase_choices.items()
+            if variable.get()
+        ]
+        if len(selected) < 2:
+            messagebox.showerror(
+                "Choose phases", "Select at least two phases for multiphase analysis.", parent=self
+            )
+            return
+        self.multiphase_selection = selected
+        self.is_multiphase = True
+        self.selected_model = None
+        self._clear_root()
+        self.title("Multiphase diffraction — ZAF")
+        self._build_multiphase_ui()
+        self._set_default_paths()
+        image_text = self.vars["image"].get().strip()
+        if image_text and Path(image_text).exists():
+            self._load_input_preview(Path(image_text))
+
+    def _load_custom_models(self) -> list[CrystalModel]:
+        """Reload the saved CIF library without depending on page widgets."""
+        try:
+            models = self.crystal_library.list_models()
+        except (OSError, ValueError) as exc:
+            models = []
+            self.after_idle(
+                lambda error=str(exc): messagebox.showwarning(
+                    "Crystal Library", f"Could not read saved crystals:\n{error}", parent=self
+                )
+            )
+        self.custom_models = {model.name: model for model in models}
+        return sorted(models, key=lambda item: item.name.casefold())
+
+    def _multiphase_candidates(
+        self,
+    ) -> list[tuple[str, str, str, CrystalModel | None]]:
+        candidates: list[tuple[str, str, str, CrystalModel | None]] = [
+            (f"builtin:{structure}", f"Built-in {structure}", structure, None)
+            for structure in ZAF.CRYSTAL_STRUCTURES
+        ]
+        candidates.extend(
+            (
+                f"custom:{model.cif_path}",
+                f"CIF: {model.name}",
+                "HCP" if model.is_hexagonal else "FCC",
+                model,
+            )
+            for model in sorted(
+                self.custom_models.values(), key=lambda item: item.name.casefold()
+            )
+        )
+        return candidates
+
+    def _refresh_custom_list(self, preferred: str | None = None) -> None:
+        self._load_custom_models()
+        names = sorted(self.custom_models, key=str.casefold)
+        self.custom_combo.configure(values=names)
+        chosen = preferred if preferred in self.custom_models else self.custom_choice.get()
+        self.custom_choice.set(chosen if chosen in self.custom_models else (names[0] if names else ""))
+        self._update_custom_selection_buttons()
+
+    def _update_custom_selection_buttons(self) -> None:
+        state = "normal" if self.custom_choice.get() in self.custom_models else "disabled"
+        self.custom_open_button.configure(state=state)
+        self.custom_delete_button.configure(state=state)
+
+    def _open_selected_custom(self) -> None:
+        model = self.custom_models.get(self.custom_choice.get())
+        if model is not None:
+            structure = "HCP" if model.is_hexagonal else "FCC"
+            self.show_analysis(structure, crystal_model=model)
+
+    def _import_custom_cif(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Import a crystal structure",
+            filetypes=(("CIF files", "*.cif"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            model = self.crystal_library.import_cif(Path(path))
+        except Exception as exc:
+            messagebox.showerror(
+                "Cannot Import CIF", f"The structure could not be imported:\n{exc}", parent=self
+            )
+            return
+        self._refresh_custom_list(preferred=model.name)
+        if self.__dict__.get("_custom_return_to_multiphase", False):
+            self._multiphase_return_keys.add(f"custom:{model.cif_path}")
+            self._return_to_multiphase_selection()
+        else:
+            self._open_selected_custom()
+
+    def _delete_selected_custom(self) -> None:
+        name = self.custom_choice.get()
+        if name not in self.custom_models:
+            return
+        if not messagebox.askyesno(
+            "Remove Crystal",
+            f"Remove {name!r} from your saved crystal list?\n"
+            "This also removes its saved CIF copy, but not your original file.",
+            parent=self,
+        ):
+            return
+        try:
+            self.crystal_library.delete(name)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Cannot Remove Crystal", str(exc), parent=self)
+            return
+        saved_cif_path = str(self.custom_models[name].cif_path)
+        self._custom_family_vars.pop(saved_cif_path, None)
+        return_keys = self.__dict__.get("_multiphase_return_keys")
+        if return_keys is not None:
+            return_keys.discard(f"custom:{saved_cif_path}")
+        self._refresh_custom_list()
+
+    def show_analysis(
+        self, crystal_structure: str, crystal_model: CrystalModel | None = None
+    ) -> None:
+        self.is_multiphase = False
         selected = ZAF.normalize_crystal_structure(crystal_structure)
-        if selected != self.crystal_structure:
+        old_model_path = (
+            str(self.selected_model.cif_path) if self.selected_model is not None else None
+        )
+        new_model_path = str(crystal_model.cif_path) if crystal_model is not None else None
+        if selected != self.crystal_structure or old_model_path != new_model_path:
             self.vars["current_zone"].set("")
             self.vars["expected_lattice_parameter_nm"].set("")
         self.crystal_structure = selected
+        self.selected_model = crystal_model
+        if crystal_model is None:
+            self.family_vars = self._built_in_family_vars
+        else:
+            families = ZAF.zone_families_for_structure(selected, crystal_model=crystal_model)
+            family_vars = self._custom_family_vars.setdefault(new_model_path or "", {})
+            for index, family in enumerate(families):
+                if family not in family_vars:
+                    family_vars[family] = BooleanVar(value=index < 3)
+            self.family_vars = family_vars
         self.bool_vars["hcp_four_index"].set(self.crystal_structure == "HCP")
         self._clear_root()
-        self.title(f"{self.crystal_structure} — ZAF")
+        self.title(f"{crystal_model.name if crystal_model is not None else selected} — ZAF")
         self._build_ui()
         self._refresh_hcp_notation()
         self._set_default_paths()
         image_text = self.vars["image"].get().strip()
         if image_text and Path(image_text).exists():
             self._load_input_preview(Path(image_text))
+
+    def _build_multiphase_ui(self) -> None:
+        """Keep the ordinary single-crystal controls independent of this workflow."""
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        panes = ttk.Panedwindow(self, orient="horizontal")
+        panes.grid(row=0, column=0, sticky="nsew")
+
+        left = ttk.Frame(panes, width=450, padding=12)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+        header = ttk.Frame(left)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Multiphase ZAF", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(header, text="Crystal Selection", command=self.show_landing).grid(
+            row=0, column=1, sticky="e"
+        )
+        controls = ttk.Notebook(left)
+        controls.grid(row=1, column=0, sticky="nsew")
+        basic_scroll = ScrollFrame(controls)
+        advanced_scroll = ScrollFrame(controls)
+        controls.add(basic_scroll, text="Basic")
+        controls.add(advanced_scroll, text="Advanced")
+        self._build_multiphase_basic_tab(basic_scroll.inner)
+        self._build_multiphase_advanced_tab(advanced_scroll.inner)
+        self.run_button = ttk.Button(left, text="Run Multiphase Analysis", command=self.run_analysis)
+        self.run_button.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        self.status_var = StringVar(value="Ready")
+        ttk.Label(left, textvariable=self.status_var).grid(row=3, column=0, sticky="ew", pady=(8, 0))
+
+        center = ttk.Frame(panes, width=690, padding=(8, 12))
+        center.columnconfigure(0, weight=1)
+        center.rowconfigure(0, weight=1)
+        tabs = ttk.Notebook(center)
+        tabs.grid(row=0, column=0, sticky="nsew")
+        input_frame = ttk.Frame(tabs)
+        composite_frame = ttk.Frame(tabs)
+        phase_frame = ttk.Frame(tabs)
+        tabs.add(input_frame, text="Input")
+        tabs.add(composite_frame, text="Combined Fit")
+        tabs.add(phase_frame, text="Phase Fit")
+        for frame in (input_frame, composite_frame, phase_frame):
+            frame.columnconfigure(0, weight=1)
+            frame.grid_propagate(False)
+        input_frame.rowconfigure(0, weight=1)
+        composite_frame.rowconfigure(1, weight=1)
+        phase_frame.rowconfigure(1, weight=1)
+        self.input_preview = ttk.Label(input_frame, anchor="center")
+        self.input_preview.grid(row=0, column=0, sticky="nsew")
+        self.composite_preview = ttk.Label(composite_frame, anchor="center")
+        self.composite_preview.grid(row=1, column=0, sticky="nsew")
+        self.fitted_preview = ttk.Label(phase_frame, anchor="center")
+        self.fitted_preview.grid(row=1, column=0, sticky="nsew")
+        self._build_download_bar(composite_frame, "composite")
+        phase_bar = ttk.Frame(phase_frame)
+        phase_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        phase_bar.columnconfigure(1, weight=1)
+        ttk.Label(phase_bar, text="Phase").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.multiphase_preview_choice = StringVar(value=self.multiphase_selection[0][1])
+        self.multiphase_preview_combo = ttk.Combobox(
+            phase_bar,
+            textvariable=self.multiphase_preview_choice,
+            values=[item[1] for item in self.multiphase_selection],
+            state="readonly",
+        )
+        self.multiphase_preview_combo.grid(row=0, column=1, sticky="ew")
+        self.multiphase_preview_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._show_selected_multiphase_preview()
+        )
+        phase_download = ttk.Button(
+            phase_bar, text="Download", command=lambda: self.download_preview_image("fitted"), state="disabled"
+        )
+        phase_download.grid(row=0, column=2, padx=(6, 0))
+        self.download_buttons["fitted"] = phase_download
+        self._register_preview("input", self.input_preview)
+        self._register_preview("composite", self.composite_preview)
+        self._register_preview("fitted", self.fitted_preview)
+        self._set_preview_message("composite", "Run analysis to compare the selected phases.")
+        self._set_preview_message("fitted", "Run analysis to view each phase's fit.")
+        self.simulator_button = None  # A joint sample orientation is not inferred here.
+
+        output_col = ttk.Frame(panes, width=390, padding=(8, 12, 12, 12))
+        output_col.columnconfigure(0, weight=1)
+        output_col.rowconfigure(0, weight=3)
+        output_col.rowconfigure(1, weight=2)
+        output_frame = ttk.LabelFrame(output_col, text="Phase Results", style="Section.TLabelframe")
+        output_frame.grid(row=0, column=0, sticky="nsew")
+        self.output_text = self._build_output_text(output_frame, width=42, height=18)
+        more_frame = ttk.LabelFrame(output_col, text="Notes", style="Section.TLabelframe")
+        more_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        self.more_output_text = self._build_output_text(more_frame, width=42, height=10)
+        panes.add(left, weight=0)
+        panes.add(center, weight=1)
+        panes.add(output_col, weight=0)
+        self.after_idle(lambda current=panes: self._set_initial_pane_sizes(current))
+
+    def _build_multiphase_basic_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        image_box = ttk.LabelFrame(parent, text="Shared image", style="Section.TLabelframe", padding=10)
+        image_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        image_box.columnconfigure(1, weight=1)
+        ttk.Label(image_box, text="Image").grid(row=0, column=0, sticky="w")
+        ttk.Entry(image_box, textvariable=self.vars["image"]).grid(
+            row=0, column=1, sticky="ew", padx=6
+        )
+        ttk.Button(image_box, text="Browse", command=self.browse_image).grid(row=0, column=2)
+
+        angles = ttk.LabelFrame(parent, text="Shared holder angles", style="Section.TLabelframe", padding=10)
+        angles.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for column in (1, 3):
+            angles.columnconfigure(column, weight=1)
+        ttk.Label(angles, text="Alpha deg").grid(row=0, column=0, sticky="w")
+        ttk.Entry(angles, textvariable=self.vars["alpha"], width=10).grid(
+            row=0, column=1, sticky="ew", padx=(6, 14)
+        )
+        ttk.Label(angles, text="Beta deg").grid(row=0, column=2, sticky="w")
+        ttk.Entry(angles, textvariable=self.vars["beta"], width=10).grid(
+            row=0, column=3, sticky="ew", padx=(6, 0)
+        )
+
+        phase_box = ttk.LabelFrame(parent, text="Selected phases", style="Section.TLabelframe", padding=10)
+        phase_box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        phase_box.columnconfigure(1, weight=1)
+        phase_box.columnconfigure(2, weight=1)
+        ttk.Label(phase_box, text="Phase").grid(row=0, column=0, sticky="w")
+        ttk.Label(phase_box, text="Known zone (optional)").grid(row=0, column=1, sticky="w")
+        ttk.Label(phase_box, text="Lattice a, nm (optional)").grid(row=0, column=2, sticky="w")
+        self.multiphase_entry_vars: dict[str, tuple[StringVar, StringVar]] = {}
+        for row, (key, label, structure, model) in enumerate(self.multiphase_selection, start=1):
+            zone_var = StringVar(value="")
+            lattice_var = StringVar(value="")
+            self.multiphase_entry_vars[key] = (zone_var, lattice_var)
+            hint = "[u v t w]" if structure == "HCP" else "[u v w]"
+            ttk.Label(phase_box, text=label, wraplength=120).grid(row=row, column=0, sticky="w")
+            ttk.Entry(phase_box, textvariable=zone_var, width=15).grid(
+                row=row, column=1, sticky="ew", padx=(6, 8), pady=3
+            )
+            ttk.Entry(phase_box, textvariable=lattice_var, width=13).grid(
+                row=row, column=2, sticky="ew", pady=3
+            )
+            ttk.Label(phase_box, text=hint).grid(row=row, column=3, sticky="w", padx=(4, 0))
+        ttk.Label(
+            phase_box,
+            text=(
+                "Leave a zone blank for auto-indexing. A printed scale bar calibrates "
+                "a lattice value; an orientation relationship can also compare "
+                "known phase spacings without a bar."
+            ),
+            wraplength=390,
+        ).grid(row=len(self.multiphase_selection) + 1, column=0, columnspan=4, sticky="w", pady=(7, 0))
+
+        or_box = ttk.LabelFrame(
+            parent, text="Optional orientation relationship", style="Section.TLabelframe", padding=10
+        )
+        or_box.grid(row=3, column=0, sticky="ew")
+        or_box.columnconfigure(1, weight=1)
+        or_box.columnconfigure(2, weight=1)
+        self.multiphase_or_enabled = BooleanVar(value=False)
+        ttk.Checkbutton(
+            or_box, text="Use one or two parallel direction pairs", variable=self.multiphase_or_enabled
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        labels = [item[1] for item in self.multiphase_selection]
+        self.multiphase_or_source = StringVar(value=labels[0])
+        self.multiphase_or_target = StringVar(value=labels[1])
+        ttk.Label(or_box, text=MULTIPHASE_OR_PHASE_LABELS[0]).grid(
+            row=1, column=0, sticky="w"
+        )
+        ttk.Combobox(
+            or_box, textvariable=self.multiphase_or_source, values=labels, state="readonly"
+        ).grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(or_box, text=MULTIPHASE_OR_PHASE_LABELS[1]).grid(
+            row=2, column=0, sticky="w"
+        )
+        ttk.Combobox(
+            or_box, textvariable=self.multiphase_or_target, values=labels, state="readonly"
+        ).grid(row=2, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(or_box, text="Relationship").grid(row=3, column=0, sticky="w")
+        ttk.Label(or_box, text=f"{MULTIPHASE_OR_PHASE_LABELS[0]} direction").grid(
+            row=3, column=1, sticky="w"
+        )
+        ttk.Label(or_box, text=f"{MULTIPHASE_OR_PHASE_LABELS[1]} direction").grid(
+            row=3, column=2, sticky="w"
+        )
+        self.multiphase_or_vars: dict[str, StringVar] = {}
+        for row, pair in ((4, "primary"), (5, "secondary")):
+            ttk.Label(or_box, text="1" if pair == "primary" else "2").grid(
+                row=row, column=0, sticky="w"
+            )
+            for column, side in ((1, "source"), (2, "target")):
+                variable = StringVar(value="")
+                self.multiphase_or_vars[f"{side}_{pair}"] = variable
+                ttk.Entry(or_box, textvariable=variable, width=15).grid(
+                    row=row, column=column, sticky="ew", padx=(0, 6), pady=3
+                )
+        ttk.Label(
+            or_box,
+            text=(
+                "Relationship 1 is required; leave both Relationship 2 boxes blank "
+                "if only one pair is known. One pair constrains only its corresponding "
+                "axes; two pairs define the full 3-D variant. Enter signed directions "
+                "for one crystal variant, not whole families. "
+                "Example: FCC [1 1 0] || Ni3Ti [2 -1 -1 0], and "
+                "FCC [1 -1 1] || Ni3Ti [0 0 0 1]. "
+                "Hexagonal phases use four indices. Changing signs or "
+                "permuting indices selects a different variant."
+            ),
+            wraplength=390,
+            justify="left",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    def _build_multiphase_advanced_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        scale = ttk.LabelFrame(parent, text="Scale calibration", style="Section.TLabelframe", padding=10)
+        scale.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        scale.columnconfigure(1, weight=1)
+        ttk.Label(scale, text="Printed bar, 1/nm").grid(row=0, column=0, sticky="w")
+        ttk.Entry(scale, textvariable=self.vars["scale_bar_value_inv_nm"], width=12).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Label(
+            scale,
+            text="ZAF detects the bar's pixel length; enter only its printed reciprocal-space value.",
+            wraplength=370,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        detection = ttk.LabelFrame(parent, text="Shared spot detection", style="Section.TLabelframe", padding=10)
+        detection.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for col in range(4):
+            detection.columnconfigure(col, weight=1)
+        self._labeled_entry(detection, "N peaks", "n_peaks", 0, 0)
+        self._labeled_entry(detection, "Peak percentile", "peak_percentile", 0, 2)
+        ttk.Checkbutton(detection, text="Invert image", variable=self.bool_vars["invert"]).grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(7, 0)
+        )
+        limits = ttk.LabelFrame(parent, text="Tilt limits and holder", style="Section.TLabelframe", padding=10)
+        limits.grid(row=2, column=0, sticky="ew")
+        for col in range(4):
+            limits.columnconfigure(col, weight=1)
+        self._labeled_entry(limits, "Alpha min", "alpha_min", 0, 0)
+        self._labeled_entry(limits, "Alpha max", "alpha_max", 0, 2)
+        self._labeled_entry(limits, "Beta min", "beta_min", 1, 0)
+        self._labeled_entry(limits, "Beta max", "beta_max", 1, 2)
+        self._labeled_entry(limits, "Image to holder deg", "image_to_holder_rotation_deg", 2, 0)
+        ttk.Label(limits, text="Holder order").grid(row=2, column=2, sticky="w")
+        ttk.Combobox(
+            limits, textvariable=self.vars["holder_order"], values=("xy", "yx"),
+            state="readonly", width=8,
+        ).grid(row=2, column=3, sticky="ew", padx=(6, 0))
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -2325,7 +3024,7 @@ class ZAFGUI(tk.Tk):
         header.columnconfigure(0, weight=1)
         title = ttk.Label(
             header,
-            text=f"{self.crystal_structure} ZAF",
+            text=f"{self.selected_model.name if self.selected_model is not None else self.crystal_structure} ZAF",
             style="Title.TLabel",
         )
         title.grid(row=0, column=0, sticky="w")
@@ -2453,6 +3152,7 @@ class ZAFGUI(tk.Tk):
         heading = {
             "fitted": "Fitted Diffraction Pattern",
             "map": "Zone Axis Map",
+            "composite": "Combined Phase Fit",
         }.get(kind, "Preview")
         ttk.Label(bar, text=heading).grid(row=0, column=0, sticky="w")
         button = ttk.Button(
@@ -2524,6 +3224,20 @@ class ZAFGUI(tk.Tk):
         ttk.Button(image_box, text="Browse", command=self.browse_image).grid(row=0, column=2, sticky="ew")
         row += 1
 
+        if self.selected_model is not None:
+            model = self.selected_model
+            crystal_box = ttk.LabelFrame(
+                parent, text="Imported crystal", style="Section.TLabelframe", padding=10
+            )
+            crystal_box.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+            ttk.Label(
+                crystal_box,
+                text=f"{model.name} — {model.crystal_system}; a = {model.a_nm:.5g} nm",
+                wraplength=360,
+                justify="left",
+            ).grid(row=0, column=0, sticky="w")
+            row += 1
+
         required = ttk.LabelFrame(parent, text="Required Holder Angles", style="Section.TLabelframe", padding=10)
         required.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 10))
         required.columnconfigure(1, weight=1)
@@ -2555,10 +3269,11 @@ class ZAFGUI(tk.Tk):
                 variable=self.bool_vars["hcp_four_index"],
                 command=self._refresh_hcp_notation,
             ).grid(row=0, column=0, columnspan=2, sticky="w")
-            ttk.Label(hcp_options, text="c/a").grid(row=0, column=2, sticky="e", padx=(16, 4))
-            ttk.Entry(
-                hcp_options, textvariable=self.vars["hcp_c_over_a"], width=10
-            ).grid(row=0, column=3, sticky="w")
+            if self.selected_model is None:
+                ttk.Label(hcp_options, text="c/a").grid(row=0, column=2, sticky="e", padx=(16, 4))
+                ttk.Entry(
+                    hcp_options, textvariable=self.vars["hcp_c_over_a"], width=10
+                ).grid(row=0, column=3, sticky="w")
         row += 1
 
         targets = ttk.LabelFrame(parent, text="Target Families", style="Section.TLabelframe", padding=10)
@@ -2566,7 +3281,7 @@ class ZAFGUI(tk.Tk):
         family_columns = 3
         self.family_checkbuttons = {}
         structure_families = ZAF.zone_families_for_structure(
-            self.crystal_structure
+            self.crystal_structure, crystal_model=self.selected_model
         )
         for idx, family in enumerate(structure_families):
             checkbutton = ttk.Checkbutton(
@@ -2575,6 +3290,7 @@ class ZAFGUI(tk.Tk):
                     family,
                     self.crystal_structure,
                     self.bool_vars["hcp_four_index"].get(),
+                    crystal_model=self.selected_model,
                 ),
                 variable=self.family_vars[family],
             )
@@ -2613,7 +3329,8 @@ class ZAFGUI(tk.Tk):
         for family, checkbutton in self.family_checkbuttons.items():
             checkbutton.configure(
                 text=ZAF.format_zone_family(
-                    family, self.crystal_structure, four_index
+                    family, self.crystal_structure, four_index,
+                    crystal_model=self.selected_model,
                 )
             )
 
@@ -2672,10 +3389,18 @@ class ZAFGUI(tk.Tk):
         self._labeled_entry(matching, "Max |g|", "max_g_norm", 0, 2)
         self._labeled_entry(matching, "Tolerance fraction", "tolerance_fraction", 1, 0)
         self._labeled_entry(matching, "Printed bar 1/nm", "scale_bar_value_inv_nm", 1, 2)
-        self._labeled_entry(matching, "Known lattice nm", "expected_lattice_parameter_nm", 2, 0)
+        self._labeled_entry(
+            matching,
+            "Override CIF a nm" if self.selected_model is not None else "Known lattice nm",
+            "expected_lattice_parameter_nm", 2, 0,
+        )
         ttk.Label(
             matching,
-            text="Optional: the scale-bar line is measured automatically;\nenter its printed value manually.",
+            text=(
+                "The CIF cell scale is used automatically when you enter the printed bar value."
+                if self.selected_model is not None
+                else "Optional: the scale-bar line is measured automatically;\nenter its printed value manually."
+            ),
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
         row += 1
 
@@ -2710,6 +3435,9 @@ class ZAFGUI(tk.Tk):
         ).grid(row=1, column=0, sticky="w", pady=(8, 0))
 
     def show_introduction(self) -> None:
+        if self.selected_model is not None:
+            self._show_custom_introduction()
+            return
         window = tk.Toplevel(self)
         window.title("Introduction and Field Guide")
         window.geometry("980x760")
@@ -2910,6 +3638,68 @@ class ZAFGUI(tk.Tk):
 
         ttk.Button(content, text="Close", command=window.destroy).grid(row=row, column=0, sticky="e", padx=14, pady=14)
 
+    def _show_custom_introduction(self) -> None:
+        model = self.selected_model
+        if model is None:
+            return
+        window = tk.Toplevel(self)
+        window.title(f"{model.name}: Custom Crystal Help")
+        window.geometry("860x650")
+        window.minsize(650, 480)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        scroll = ScrollFrame(window)
+        scroll.grid(row=0, column=0, sticky="nsew")
+        content = scroll.inner
+        content.columnconfigure(0, weight=1)
+        ttk.Label(
+            content, text=f"{model.name} — Custom Crystal", style="Title.TLabel"
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(14, 8))
+        row = 1
+        row = self._intro_section(
+            content, row, "Crystal structure",
+            f"ZAF reads the lattice and atomic sites from your saved CIF file at:\n"
+            f"{model.cif_path}\n\n"
+            "Diffraction references are calculated from that structure, not selected "
+            "from a database of patterns. The indexed directions refer to the axes "
+            "and setting of the imported CIF unit cell.",
+        )
+        row = self._intro_section(
+            content, row, "Indexing and scale",
+            "Choose a diffraction image and run analysis as with the built-in models. "
+            "ZAF detects spots and compares them with calculated zone-axis spot positions. "
+            "If your image contains a scale bar, enter the printed reciprocal-space "
+            "value under Advanced to use the CIF lattice dimensions as an additional "
+            "constraint. A single image can still be ambiguous, especially where "
+            "different zone axes have similar projected geometries.",
+        )
+        row = self._intro_section(
+            content, row, "Direction notation and target axes",
+            "Hexagonal CIF structures use four-index [u v t w] zone notation by default; "
+            "the checkbox in the Basic tab switches to three-index notation. "
+            "Their automatic search uses the eight built-in HCP-style zone "
+            "families. Other structures use three-index [u v w] notation and "
+            "search primitive directions reduced by the CIF point-group "
+            "symmetry. The automatic bound on |u| + |v| + |w| is 8 for cubic, "
+            "6 for tetragonal, orthorhombic, and trigonal, and 4 for "
+            "monoclinic or triclinic structures. Enter a higher-index direction "
+            "in Known current zone to analyze one outside the automatic list. "
+            "The Target Families checkboxes choose which axes appear in the "
+            "tilt table and maps; they do not restrict automatic indexing.",
+        )
+        row = self._intro_section(
+            content, row, "Simulators and saved structures",
+            "The sample-rotation simulator and its reachable target-axis map use "
+            "the indexed CIF orientation. Its detailed 3D tilt/diffraction simulator "
+            "is currently limited to the built-in FCC, BCC, and HCP models. "
+            "Imported CIF files are copied to your user library. Use Crystal Selection "
+            "to switch structures or remove a saved copy; removing one does not "
+            "delete your original CIF file.",
+        )
+        ttk.Button(content, text="Close", command=window.destroy).grid(
+            row=row, column=0, sticky="e", padx=14, pady=14
+        )
+
     def _intro_section(self, parent: ttk.Frame, row: int, title: str, text: str) -> int:
         frame = ttk.LabelFrame(parent, text=title, style="Section.TLabelframe", padding=10)
         frame.grid(row=row, column=0, sticky="ew", padx=14, pady=(0, 10))
@@ -2966,6 +3756,8 @@ class ZAFGUI(tk.Tk):
         self.status_var.set(f"Saved {title}: {path}")
 
     def _preview_source_for_kind(self, kind: str) -> tuple[Image.Image | Path | None, str, str]:
+        if kind == "composite":
+            return self.latest_previews.composite_image, "_multiphase_fit.png", "Combined Phase Fit"
         if kind == "predicted":
             return (
                 self.latest_previews.predicted_image or self.latest_previews.predicted_path,
@@ -2973,6 +3765,15 @@ class ZAFGUI(tk.Tk):
                 "Predicted Zone Pattern",
             )
         if kind == "fitted":
+            if self.__dict__.get("is_multiphase", False):
+                selected_label = self.multiphase_preview_choice.get()
+                key = next(
+                    (key for key, label, _, _ in self.multiphase_selection if label == selected_label),
+                    "",
+                )
+                image = (self.latest_previews.phase_images or {}).get(key)
+                safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", selected_label).strip("._")
+                return image, f"_{safe_name or 'phase'}_fitted_pattern.png", f"{selected_label} Fit"
             return (
                 self.latest_previews.fitted_image or self.latest_previews.fitted_path,
                 "_fitted_diffraction_pattern.png",
@@ -3003,6 +3804,12 @@ class ZAFGUI(tk.Tk):
         )
 
     def _load_generated_previews(self, previews: PreviewResult) -> None:
+        if self.__dict__.get("is_multiphase", False):
+            self._load_preview_target(
+                "composite", previews.composite_image, "No combined phase fit is available."
+            )
+            self._show_selected_multiphase_preview()
+            return
         self._load_preview_target(
             "fitted",
             previews.fitted_image or previews.fitted_path,
@@ -3078,6 +3885,18 @@ class ZAFGUI(tk.Tk):
             self.fitted_photo = photo
         elif kind == "map":
             self.zone_map_photo = photo
+        elif kind == "composite":
+            self.composite_photo = photo
+
+    def _show_selected_multiphase_preview(self) -> None:
+        label = self.multiphase_preview_choice.get()
+        key = next(
+            (key for key, name, _, _ in self.multiphase_selection if name == label),
+            "",
+        )
+        image = (self.latest_previews.phase_images or {}).get(key)
+        self._load_preview_target("fitted", image, "Run analysis to view this phase's fit.")
+        self._set_download_buttons_state()
 
     def _schedule_preview_resize(self, kind: str) -> None:
         previous = self._preview_resize_jobs.pop(kind, None)
@@ -3182,6 +4001,8 @@ class ZAFGUI(tk.Tk):
             return None
 
     def build_settings(self) -> dict[str, object]:
+        if self.__dict__.get("is_multiphase", False):
+            return self._build_multiphase_settings()
         image = self.vars["image"].get().strip()
         if not image:
             raise ValueError("Please choose an input diffraction image.")
@@ -3191,7 +4012,9 @@ class ZAFGUI(tk.Tk):
 
         families = [
             family
-            for family in ZAF.zone_families_for_structure(self.crystal_structure)
+            for family in ZAF.zone_families_for_structure(
+                self.crystal_structure, crystal_model=self.selected_model
+            )
             if self.family_vars[family].get()
         ]
         if not families:
@@ -3201,11 +4024,16 @@ class ZAFGUI(tk.Tk):
             self.crystal_structure == "HCP"
             and self.bool_vars["hcp_four_index"].get()
         )
-        hcp_c_over_a = self._float_value(
-            "hcp_c_over_a", ZAF.DEFAULT_HCP_C_OVER_A
-        )
-        if hcp_c_over_a <= 0:
-            raise ValueError("HCP c/a must be positive.")
+        if self.selected_model is None:
+            hcp_c_over_a = self._float_value(
+                "hcp_c_over_a", ZAF.DEFAULT_HCP_C_OVER_A
+            )
+            if hcp_c_over_a <= 0:
+                raise ValueError("HCP c/a must be positive.")
+        else:
+            # The CIF provides the complete cell; the built-in HCP c/a field
+            # must not affect a custom structure or block its analysis.
+            hcp_c_over_a = ZAF.DEFAULT_HCP_C_OVER_A
         current_zone_text = self.vars["current_zone"].get().strip()
         current_zone = (
             ZAF.parse_zone_direction(
@@ -3245,6 +4073,7 @@ class ZAFGUI(tk.Tk):
             "alpha": self._float_value("alpha"),
             "beta": self._float_value("beta"),
             "crystal_structure": self.crystal_structure,
+            "crystal_model": self.selected_model,
             "hcp_c_over_a": hcp_c_over_a,
             "hcp_four_index": hcp_four_index,
             "target_families": families,
@@ -3281,6 +4110,131 @@ class ZAFGUI(tk.Tk):
             "show_kikuchi_guides": self.bool_vars["show_kikuchi_guides"].get(),
             "kikuchi_max_g_norm": self._float_value("kikuchi_max_g_norm", 0.0),
             "export_files": self.selected_export_files(),
+        }
+
+    def _build_multiphase_settings(self) -> dict[str, object]:
+        from ZAF_multiphase import OrientationSpec, PhaseSpec
+
+        image_text = self.vars["image"].get().strip()
+        if not image_text:
+            raise ValueError("Please choose an input diffraction image.")
+        image_path = Path(image_text)
+        if not image_path.is_file():
+            raise ValueError(f"Input image does not exist:\n{image_path}")
+        scale_value = self._optional_positive_float_value(
+            "scale_bar_value_inv_nm", "Printed scale-bar value"
+        )
+        labels_to_phases = {label: (key, structure) for key, label, structure, _ in self.multiphase_selection}
+        phase_specs = []
+        for key, label, structure, model in self.multiphase_selection:
+            zone_var, lattice_var = self.multiphase_entry_vars[key]
+            zone_text = zone_var.get().strip()
+            try:
+                zone = (
+                    ZAF.parse_zone_direction(zone_text, structure, structure == "HCP")
+                    if zone_text else None
+                )
+            except (ValueError, argparse.ArgumentTypeError) as exc:
+                raise ValueError(f"{label}: invalid known zone: {exc}") from exc
+            lattice_text = lattice_var.get().strip()
+            try:
+                lattice_nm = float(lattice_text) if lattice_text else None
+            except ValueError as exc:
+                raise ValueError(f"{label}: lattice a must be a number in nm.") from exc
+            if lattice_nm is not None:
+                if not math.isfinite(lattice_nm) or lattice_nm <= 0:
+                    raise ValueError(f"{label}: lattice a must be positive and finite.")
+            phase_specs.append(
+                PhaseSpec(
+                    key=key,
+                    label=label,
+                    crystal_structure=structure,
+                    crystal_model=model,
+                    known_zone=zone,
+                    lattice_nm=lattice_nm,
+                )
+            )
+        orientation = None
+        if self.multiphase_or_enabled.get():
+            source_label = self.multiphase_or_source.get()
+            target_label = self.multiphase_or_target.get()
+            if source_label not in labels_to_phases or target_label not in labels_to_phases:
+                raise ValueError("Choose Phase 1 and Phase 2 for the orientation relationship.")
+            source_key, source_structure = labels_to_phases[source_label]
+            target_key, target_structure = labels_to_phases[target_label]
+            if source_key == target_key:
+                raise ValueError("The two orientation-relationship phases must be different.")
+            raw_directions = {
+                key: variable.get().strip()
+                for key, variable in self.multiphase_or_vars.items()
+            }
+            if not raw_directions["source_primary"] or not raw_directions["target_primary"]:
+                raise ValueError(
+                    "Relationship 1 needs one signed direction for Phase 1 and Phase 2."
+                )
+            if bool(raw_directions["source_secondary"]) != bool(
+                raw_directions["target_secondary"]
+            ):
+                raise ValueError(
+                    "Relationship 2 must contain directions for both phases, "
+                    "or be left blank for both phases."
+                )
+            directions: dict[str, tuple[int, int, int] | None] = {}
+            for side, phase_name, label, structure in (
+                ("source", "Phase 1", source_label, source_structure),
+                ("target", "Phase 2", target_label, target_structure),
+            ):
+                for pair_name, field_name in (
+                    ("primary", "Relationship 1"),
+                    ("secondary", "Relationship 2"),
+                ):
+                    raw = raw_directions[f"{side}_{pair_name}"]
+                    if not raw:
+                        directions[f"{side}_{pair_name}"] = None
+                        continue
+                    try:
+                        directions[f"{side}_{pair_name}"] = ZAF.parse_zone_direction(
+                            raw, structure, structure == "HCP"
+                        )
+                    except (ValueError, argparse.ArgumentTypeError) as exc:
+                        raise ValueError(
+                            f"{phase_name} ({label}) {field_name} direction is invalid: {exc}"
+                        ) from exc
+            orientation = OrientationSpec(
+                source_key=source_key,
+                target_key=target_key,
+                source_primary=directions["source_primary"],
+                source_secondary=directions["source_secondary"],
+                target_primary=directions["target_primary"],
+                target_secondary=directions["target_secondary"],
+            )
+        alpha_limits = (self._float_value("alpha_min"), self._float_value("alpha_max"))
+        beta_limits = (self._float_value("beta_min"), self._float_value("beta_max"))
+        if alpha_limits[0] >= alpha_limits[1] or beta_limits[0] >= beta_limits[1]:
+            raise ValueError("Each minimum tilt limit must be less than its maximum.")
+        n_peaks = self._int_value("n_peaks", 120)
+        percentile = self._float_value("peak_percentile", 99.0)
+        if n_peaks < 3 or not 0 < percentile < 100:
+            raise ValueError("Use at least 3 peaks and a peak percentile between 0 and 100.")
+        return {
+            "multiphase": True,
+            "image": image_path,
+            "invert": self.bool_vars["invert"].get(),
+            "phases": phase_specs,
+            "orientation": orientation,
+            "scale_bar_value_inv_nm": scale_value,
+            "n_peaks": n_peaks,
+            "peak_percentile": percentile,
+            "alpha": self._float_value("alpha"),
+            "beta": self._float_value("beta"),
+            "alpha_limits": alpha_limits,
+            "beta_limits": beta_limits,
+            "image_to_holder_rotation_deg": self._float_value(
+                "image_to_holder_rotation_deg", 90.0
+            ),
+            "holder_order": self.vars["holder_order"].get().strip() or "xy",
+            "export_files": [],
+            "output_prefix": None,
         }
 
     def selected_export_files(self) -> list[str]:
@@ -3351,6 +4305,8 @@ class ZAFGUI(tk.Tk):
         return image.with_suffix("")  # type: ignore[union-attr]
 
     def preview_paths_from_settings(self, settings: dict[str, object]) -> PreviewResult:
+        if settings.get("multiphase"):
+            return PreviewResult()
         prefix = self.output_prefix_from_settings(settings)
         return PreviewResult(
             predicted_path=Path(f"{prefix}_predicted_zone_pattern.png") if "predicted_pattern" in settings["export_files"] else None,
@@ -3387,7 +4343,11 @@ class ZAFGUI(tk.Tk):
         status = "ok"
         with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
             try:
-                previews = self._run_gui_analysis(settings, previews)
+                previews = (
+                    self._run_multiphase_analysis(settings, previews)
+                    if settings.get("multiphase")
+                    else self._run_gui_analysis(settings, previews)
+                )
             except SystemExit as exc:
                 code = exc.code if isinstance(exc.code, int) else 1
                 if code != 0:
@@ -3398,15 +4358,111 @@ class ZAFGUI(tk.Tk):
                 traceback.print_exc()
         self.result_queue.put((status, stream.getvalue(), previews))
 
+    def _run_multiphase_analysis(
+        self, settings: dict[str, object], previews: PreviewResult
+    ) -> PreviewResult:
+        from ZAF_multiphase import analyze_multiphase
+
+        image_path = Path(settings["image"])  # type: ignore[arg-type]
+        gray, rgb = ZAF.load_grayscale(image_path, invert=bool(settings["invert"]))
+        scale_bar_pixels = None
+        if settings["scale_bar_value_inv_nm"] is not None:
+            with contextlib.suppress(Exception):
+                detected = ZAF.detect_scale_bar_pixels(image_path)
+                if detected is not None:
+                    scale_bar_pixels = float(detected["length_px"])
+        result = analyze_multiphase(
+            gray,
+            rgb,
+            settings["phases"],
+            n_peaks=int(settings["n_peaks"]),
+            peak_percentile=float(settings["peak_percentile"]),
+            scale_bar_pixels=scale_bar_pixels,
+            scale_bar_value_inv_nm=settings["scale_bar_value_inv_nm"],
+            orientation=settings["orientation"],
+            alpha_deg=float(settings["alpha"]),
+            beta_deg=float(settings["beta"]),
+            alpha_limits=settings["alpha_limits"],
+            beta_limits=settings["beta_limits"],
+            image_to_holder_rotation_deg=float(settings["image_to_holder_rotation_deg"]),
+            holder_order=str(settings["holder_order"]),
+        )
+        previews.composite_image = result.composite_image
+        previews.phase_images = {
+            phase.spec.key: phase.fitted_image for phase in result.phase_results
+        }
+        previews.phase_labels = {
+            phase.spec.key: phase.spec.label for phase in result.phase_results
+        }
+        print("Multiphase diffraction results")
+        print("==============================")
+        if settings["scale_bar_value_inv_nm"] is not None and scale_bar_pixels is None:
+            print("Warning: the printed scale bar could not be detected; lattice calibration was not used.")
+        for phase in result.phase_results:
+            best = phase.indexing.best
+            print(f"\n{phase.spec.label}")
+            print("-" * len(phase.spec.label))
+            print(
+                "Zone: "
+                + ZAF.format_zone_direction(
+                    best.zone, best.crystal_structure, best.hcp_four_index
+                )
+                + f"  ({ZAF.format_zone_family(best.family, best.crystal_structure, best.hcp_four_index, best.crystal_model)})"
+            )
+            print(
+                f"Matched spots: {best.matched_count}/{best.visible_count}; "
+                f"RMS: {best.rms_px:.2f} px; score: {best.score:.2f}"
+            )
+            print(f"In-plane rotation: {best.angle_deg:.2f} deg")
+            if phase.or_predicted_zone is not None:
+                or_zone = ZAF.format_zone_direction(
+                    phase.or_predicted_zone,
+                    best.crystal_structure,
+                    best.hcp_four_index,
+                )
+                print(
+                    f"OR-predicted zone: {or_zone} "
+                    f"(index approximation {phase.or_residual_deg:.2f} deg)"
+                )
+                if phase.or_inplane_error_deg is not None:
+                    print(
+                        f"OR in-plane difference: {phase.or_inplane_error_deg:.2f} deg"
+                    )
+            if best.estimated_lattice_nm is not None:
+                print(f"Estimated lattice a: {best.estimated_lattice_nm:.4f} nm")
+            if phase.indexing.diagnostics.harmonic_alias_scale is not None:
+                print(
+                    "Warning: a nearly tied half-scale FCC fit was rejected; "
+                    "confirm with a known lattice and printed scale bar if available."
+                )
+            if phase.indexing.diagnostics.ambiguous:
+                print("Warning: phase zone is ambiguous; inspect the fitted spots and alternatives.")
+        for warning in result.warnings:
+            print(f"\nWarning: {warning}")
+        print(
+            "\nMatched spots from different phases can overlap. The composite is a "
+            "comparison, not proof that every phase is present. Colors identify "
+            "the phases; inspect each phase fit."
+        )
+        print("\nMULTIPHASE_TARGET_TABLES")
+        for phase in result.phase_results:
+            print(f"\n{phase.spec.label}: target-axis predictions")
+            if phase.target_rows:
+                ZAF.print_target_table(phase.target_rows)
+            else:
+                print("No target axes are available within the selected tilt limits.")
+        return previews
+
     def _run_gui_analysis(self, settings: dict[str, object], previews: PreviewResult) -> PreviewResult:
         gray, rgb = ZAF.load_grayscale(settings["image"], invert=settings["invert"])  # type: ignore[arg-type]
         scale_bar_pixels: float | None = None
-        with contextlib.suppress(Exception):
-            scale_bar_result = ZAF.detect_scale_bar_pixels(
-                Path(settings["image"])  # type: ignore[arg-type]
-            )
-            if scale_bar_result is not None:
-                scale_bar_pixels = float(scale_bar_result["length_px"])
+        if settings["scale_bar_value_inv_nm"] is not None:
+            with contextlib.suppress(Exception):
+                scale_bar_result = ZAF.detect_scale_bar_pixels(
+                    Path(settings["image"])  # type: ignore[arg-type]
+                )
+                if scale_bar_result is not None:
+                    scale_bar_pixels = float(scale_bar_result["length_px"])
 
         try:
             indexing = ZAF.index_diffraction_pattern(
@@ -3425,6 +4481,7 @@ class ZAFGUI(tk.Tk):
                 scale_bar_value_inv_nm=settings["scale_bar_value_inv_nm"],  # type: ignore[arg-type]
                 expected_lattice_parameter_nm=settings["expected_lattice_parameter_nm"],  # type: ignore[arg-type]
                 crystal_structure=str(settings["crystal_structure"]),
+                crystal_model=settings["crystal_model"],  # type: ignore[arg-type]
                 hcp_c_over_a=float(settings["hcp_c_over_a"]),
                 hcp_four_index=bool(settings["hcp_four_index"]),
             )
@@ -3465,7 +4522,8 @@ class ZAFGUI(tk.Tk):
             settings["target_families"]
             if settings["map_show_target_families"]
             else ZAF.zone_families_for_structure(
-                str(settings["crystal_structure"])
+                str(settings["crystal_structure"]),
+                crystal_model=settings["crystal_model"],  # type: ignore[arg-type]
             )
         )
         map_points = ZAF.zone_axis_map_points(
@@ -3507,6 +4565,10 @@ class ZAFGUI(tk.Tk):
             print("\nApplied correction: fitted pattern indexing rotated by 180 deg.")
         ZAF.print_target_table(rows)
         export_files = set(settings["export_files"])  # type: ignore[arg-type]
+        crystal_model = settings["crystal_model"]
+        crystal_label = (
+            crystal_model.name if crystal_model is not None else best.crystal_structure
+        )
         predicted_image: Image.Image | None = None
         if "predicted_pattern" in export_files:
             predicted_image = ZAF.predicted_pattern_image(
@@ -3514,7 +4576,7 @@ class ZAFGUI(tk.Tk):
                 rgb.size,
                 rotated=False,
                 title=(
-                    f"Predicted {best.crystal_structure} "
+                    f"Predicted {crystal_label} "
                     f"{ZAF.format_zone_direction(best.zone, best.crystal_structure, best.hcp_four_index)} "
                     "before rotation"
                 ),
@@ -3529,7 +4591,7 @@ class ZAFGUI(tk.Tk):
             draw_guides=settings["show_kikuchi_guides"],  # type: ignore[arg-type]
             kikuchi_max_g_norm=settings["kikuchi_max_g_norm"],  # type: ignore[arg-type]
             title=(
-                f"Fitted {best.crystal_structure} "
+                f"Fitted {crystal_label} "
                 f"{ZAF.format_zone_direction(best.zone, best.crystal_structure, best.hcp_four_index)}"
             ),
         )
@@ -3564,10 +4626,16 @@ class ZAFGUI(tk.Tk):
         else:
             print("\nPreview-only mode: no files were written.")
         if settings["current_zone"] is None:
-            print(
-                "\nNote: the auto-indexed zone uses a conventional symmetry-equivalent assignment. "
-                "Use Known current zone if you need to force a specific equivalent index."
-            )
+            if crystal_model is None:
+                print(
+                    "\nNote: the auto-indexed zone uses a conventional symmetry-equivalent assignment. "
+                    "Use Known current zone if you need to force a specific equivalent index."
+                )
+            else:
+                print(
+                    "\nNote: zone indices refer to the axes of the imported CIF unit cell. "
+                    "Equivalent-index conventions may differ from a published setting."
+                )
         previews.predicted_image = predicted_image
         previews.fitted_image = fitted_image
         previews.map_image = zone_map_image
@@ -3589,6 +4657,7 @@ class ZAFGUI(tk.Tk):
             crystal_structure=str(settings["crystal_structure"]),
             hcp_c_over_a=float(settings["hcp_c_over_a"]),
             hcp_four_index=bool(settings["hcp_four_index"]),
+            crystal_model=settings["crystal_model"],  # type: ignore[arg-type]
         )
         return previews
 
@@ -3601,7 +4670,11 @@ class ZAFGUI(tk.Tk):
 
         self.run_button.configure(state="normal")
         if status == "ok":
-            main_output, more_output = self._split_analysis_output(output)
+            if self.__dict__.get("is_multiphase", False):
+                main_output, separator, target_output = output.partition("MULTIPHASE_TARGET_TABLES")
+                more_output = target_output.strip() + "\n" if separator else ""
+            else:
+                main_output, more_output = self._split_analysis_output(output)
             self._write_output(main_output, more_output)
             self.status_var.set("Analysis complete")
             self.latest_previews = previews
@@ -3725,6 +4798,8 @@ def bundle_self_test() -> int:
     """Check frozen imports and data files without requiring a display server."""
     import PIL
     import scipy
+    import ZAF_multiphase
+    import ZAF_orientation
 
     if not BUNDLED_INSTRUMENT_SETTINGS_PATH.is_file():
         print(
@@ -3770,6 +4845,31 @@ def bundle_self_test() -> int:
                 f"(64 px requested, {font_height} px measured)"
             )
         tcl_patchlevel = str(tk.Tcl().eval("info patchlevel"))
+        # Parse a real temporary CIF through pymatgen, including the symmetry
+        # analyzer, to catch hidden-import/data omissions in frozen bundles.
+        with tempfile.TemporaryDirectory(prefix="zaf-cif-selftest-") as temporary:
+            test_cif = Path(temporary) / "test_cell.cif"
+            test_cif.write_text(
+                "data_ZAFBundleTest\n"
+                "_cell_length_a 4.0\n"
+                "_cell_length_b 4.0\n"
+                "_cell_length_c 6.0\n"
+                "_cell_angle_alpha 90\n"
+                "_cell_angle_beta 90\n"
+                "_cell_angle_gamma 90\n"
+                "_symmetry_space_group_name_H-M 'P 1'\n"
+                "loop_\n"
+                "_atom_site_label\n"
+                "_atom_site_type_symbol\n"
+                "_atom_site_fract_x\n"
+                "_atom_site_fract_y\n"
+                "_atom_site_fract_z\n"
+                "Fe1 Fe 0 0 0\n",
+                encoding="utf-8",
+            )
+            test_model = from_cif(test_cif)
+            if len(test_model.sites) != 1 or abs(test_model.a_nm - 0.4) > 1e-8:
+                raise RuntimeError("pymatgen parsed the test CIF incorrectly")
     except Exception as exc:
         print(f"ZAF bundle self-test failed: {exc}", file=sys.stderr)
         return 1
@@ -3789,6 +4889,8 @@ def bundle_self_test() -> int:
     )
     print(f"  instrument settings template: {BUNDLED_INSTRUMENT_SETTINGS_PATH}")
     print(f"  runtime PNG assets: {len(RUNTIME_ASSET_FILENAMES)}")
+    print("  pymatgen CIF import: OK")
+    print("  multiphase and orientation modules: OK")
     return 0
 
 

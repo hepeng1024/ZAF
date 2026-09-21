@@ -47,8 +47,10 @@ RUNTIME_ASSET_DIR="$RELEASE_DIR/_internal/assets"
 [[ -d "$RUNTIME_ASSET_DIR" ]] || fail "runtime asset directory missing: $RUNTIME_ASSET_DIR"
 runtime_assets=(
     "BCC.png"
+    "Customized_crystal.png"
     "FCC.png"
     "HCP.png"
+    "Multiphase_icon.png"
     "Negative alpha tilt arrow.png"
     "Negative beta tilt arrow.png"
     "Positive alpha tilt arrow.png"
@@ -79,11 +81,11 @@ self_test_output="$("$RELEASE_DIR/run_ZAF.sh" --bundle-self-test 2>&1)" \
 printf '%s\n' "$self_test_output"
 grep -q '^ZAF bundle self-test: OK$' <<< "$self_test_output" \
     || fail "bundle self-test did not report success"
-for component in 'ZAF backend:' 'NumPy:' 'SciPy:' 'Pillow:' 'Matplotlib:' 'Tcl/Tk:'; do
+for component in 'ZAF backend:' 'NumPy:' 'SciPy:' 'Pillow:' 'Matplotlib:' 'Tcl/Tk:' 'pymatgen CIF import:' 'multiphase and orientation modules:'; do
     grep -q "$component" <<< "$self_test_output" \
         || fail "bundle self-test did not confirm $component"
 done
-pass "scientific, imaging, plotting, Tkinter, and local backend imports work"
+pass "scientific, CIF, imaging, plotting, Tkinter, and local backend imports work"
 
 launcher_test_root="$(mktemp -d -t zaf-launcher-verify-XXXXXX)"
 cleanup_launcher_test() {

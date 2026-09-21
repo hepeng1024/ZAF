@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Find reachable FCC, BCC, or HCP zone axes from one indexed TEM diffraction pattern.
+Find reachable zone axes from one indexed TEM diffraction pattern.
 
 The script does three jobs:
 1. Detect diffraction spots in an experimental image.
-2. Match the spots against analytic patterns for the selected crystal structure
-   families while allowing arbitrary in-plane rotation.
+2. Match the spots against calculated patterns for the selected crystal
+   structure while allowing arbitrary in-plane rotation. Built-in FCC, BCC,
+   and HCP models remain available; the GUI can also supply a CIF-derived cell.
 3. Use the indexed pattern plus the current alpha/beta angles to predict the
    holder angles for other axes in the selected families.
 
@@ -33,8 +34,12 @@ import os
 import re
 import sys
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence
+
+if TYPE_CHECKING:
+    from ZAF_crystals import CrystalModel
 
 
 try:
@@ -57,11 +62,25 @@ Array = "np.ndarray"
 MAX_ZONE_FAMILY_INDEX_SUM = 8
 DEFAULT_REFLECTION_MAX_INDEX = 12
 DEFAULT_REFLECTION_MAX_G_NORM = 13.0
+CUSTOM_AUTO_ZONE_INDEX_SUM_LOW_SYMMETRY = 4
+CUSTOM_AUTO_ZONE_INDEX_SUM_MEDIUM_SYMMETRY = 6
 AMBIGUITY_ABSOLUTE_SCORE_GAP = 1.0
 AMBIGUITY_RELATIVE_SCORE_GAP = 0.03
 ADAPTIVE_MIN_PEAKS = 240
 ADAPTIVE_MAX_PEAKS = 480
 ADAPTIVE_PEAK_PERCENTILE = 98.5
+# Imported structures often need weaker superlattice maxima that sit below the
+# broad, bright matrix reflections in a mixed-phase image.  Keep this lower
+# threshold confined to the guarded custom-CIF adaptive pass; built-in
+# FCC/BCC/HCP detection continues to use ADAPTIVE_PEAK_PERCENTILE.
+CUSTOM_ADAPTIVE_PEAK_PERCENTILE = 92.0
+# A sparse custom-CIF image does not need a second *all-family* search when its
+# first-pass evidence is already decisive and nearly complete.  The dense pass
+# can refine just that family. These gates are deliberately stricter than the
+# normal ambiguity test so weak superlattice patterns still search every family.
+CUSTOM_STRONG_INITIAL_MIN_MATCHES = 12
+CUSTOM_STRONG_INITIAL_COVERAGE = 0.90
+CUSTOM_STRONG_INITIAL_GAP_FACTOR = 2.0
 LOW_ORDER_COMPLETENESS_WEIGHT = 5.0
 LATTICE_CALIBRATION_RELATIVE_SIGMA = 0.15
 CRYSTAL_STRUCTURES = ("FCC", "BCC", "HCP")
@@ -203,6 +222,7 @@ class PatternMatch:
     estimated_lattice_nm: float | None = None
     lattice_relative_error: float | None = None
     selection_score: float | None = None
+    crystal_model: CrystalModel | None = None
 
     @property
     def matched_count(self) -> int:
@@ -238,6 +258,7 @@ class IndexingDiagnostics:
     ambiguous: bool
     scale_bar_pixels: float | None = None
     calibration_used: bool = False
+    harmonic_alias_scale: float | None = None
 
 
 @dataclass
@@ -259,6 +280,7 @@ class ZoneAxisMapPoint:
     crystal_structure: str = "FCC"
     hcp_four_index: bool = False
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A
+    crystal_model: CrystalModel | None = None
 
 
 def normalize(v: Array) -> Array:
@@ -303,7 +325,61 @@ def normalize_crystal_structure(crystal_structure: str) -> str:
     return structure
 
 
-def zone_families_for_structure(crystal_structure: str) -> tuple[str, ...]:
+def _custom_symmetry_orbit(
+    zone: Sequence[int], crystal_model: CrystalModel
+) -> tuple[tuple[int, int, int], ...]:
+    """Apply the CIF point group to a direct-lattice direction."""
+    result: set[tuple[int, int, int]] = set()
+    direction = np.asarray(reduce_miller(zone), dtype=float)
+    for rotation in crystal_model.symmetry_rotations:
+        transformed = np.asarray(rotation, dtype=float) @ direction
+        integers = np.rint(transformed).astype(int)
+        if np.max(np.abs(transformed - integers)) > 1e-5:
+            continue
+        result.add(canonical_line(integers))
+    result.add(canonical_line(zone))
+    return tuple(sorted(result))
+
+
+@lru_cache(maxsize=32)
+def _custom_zone_families(crystal_model: CrystalModel) -> tuple[str, ...]:
+    if crystal_model.is_hexagonal:
+        return HCP_ZONE_FAMILIES
+    if crystal_model.crystal_system == "cubic":
+        max_index_sum = MAX_ZONE_FAMILY_INDEX_SUM
+    elif crystal_model.crystal_system in {"tetragonal", "orthorhombic", "trigonal"}:
+        max_index_sum = CUSTOM_AUTO_ZONE_INDEX_SUM_MEDIUM_SYMMETRY
+    else:
+        max_index_sum = CUSTOM_AUTO_ZONE_INDEX_SUM_LOW_SYMMETRY
+    # For low-symmetry cells, cubic permutations are NOT equivalent. Search
+    # each primitive line through this bound, collapsing only by the CIF point
+    # group. A higher-index axis can always be supplied as Known current zone.
+    lines = {
+        canonical_line((u, v, w))
+        for u, v, w in itertools.product(
+            range(-max_index_sum, max_index_sum + 1),
+            repeat=3,
+        )
+        if 0 < abs(u) + abs(v) + abs(w) <= max_index_sum
+        and math.gcd(u, v, w) == 1
+    }
+    remaining = set(lines)
+    families: list[str] = []
+    while remaining:
+        base = min(
+            remaining,
+            key=lambda z: (sum(map(abs, z)), max(map(abs, z)), z),
+        )
+        remaining.difference_update(_custom_symmetry_orbit(base, crystal_model))
+        families.append(",".join(str(value) for value in base))
+    return tuple(families)
+
+
+def zone_families_for_structure(
+    crystal_structure: str, crystal_model: CrystalModel | None = None
+) -> tuple[str, ...]:
+    if crystal_model is not None:
+        return _custom_zone_families(crystal_model)
     structure = normalize_crystal_structure(crystal_structure)
     return HCP_ZONE_FAMILIES if structure == "HCP" else SUPPORTED_ZONE_FAMILIES
 
@@ -311,8 +387,11 @@ def zone_families_for_structure(crystal_structure: str) -> tuple[str, ...]:
 def direct_lattice_matrix(
     crystal_structure: str,
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A,
+    crystal_model: CrystalModel | None = None,
 ) -> Array:
     """Return direct-lattice basis vectors as Cartesian matrix columns."""
+    if crystal_model is not None:
+        return np.asarray(crystal_model.direct_matrix, dtype=float)
     structure = normalize_crystal_structure(crystal_structure)
     if structure != "HCP":
         return np.eye(3, dtype=float)
@@ -331,10 +410,11 @@ def direct_lattice_matrix(
 def reciprocal_lattice_matrix(
     crystal_structure: str,
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A,
+    crystal_model: CrystalModel | None = None,
 ) -> Array:
     """Return reciprocal basis without the common 2*pi factor."""
     return np.linalg.inv(
-        direct_lattice_matrix(crystal_structure, hcp_c_over_a)
+        direct_lattice_matrix(crystal_structure, hcp_c_over_a, crystal_model)
     ).T
 
 
@@ -342,8 +422,9 @@ def direction_cartesian(
     zone: Sequence[int],
     crystal_structure: str = "FCC",
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A,
+    crystal_model: CrystalModel | None = None,
 ) -> Array:
-    return direct_lattice_matrix(crystal_structure, hcp_c_over_a) @ np.asarray(
+    return direct_lattice_matrix(crystal_structure, hcp_c_over_a, crystal_model) @ np.asarray(
         zone, dtype=float
     )
 
@@ -352,8 +433,9 @@ def reciprocal_cartesian(
     hkl: Sequence[int],
     crystal_structure: str = "FCC",
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A,
+    crystal_model: CrystalModel | None = None,
 ) -> Array:
-    return reciprocal_lattice_matrix(crystal_structure, hcp_c_over_a) @ np.asarray(
+    return reciprocal_lattice_matrix(crystal_structure, hcp_c_over_a, crystal_model) @ np.asarray(
         hkl, dtype=float
     )
 
@@ -468,20 +550,30 @@ def format_zone_family(
     family: str,
     crystal_structure: str = "FCC",
     hcp_four_index: bool = False,
+    crystal_model: CrystalModel | None = None,
 ) -> str:
     structure = normalize_crystal_structure(crystal_structure)
-    base = parse_family_direction(family, structure)
+    base = parse_family_direction(family, structure, crystal_model)
     return format_zone_direction(
         base, structure, hcp_four_index, brackets="<>"
     )
 
 
-def family_name(v: Sequence[int], crystal_structure: str = "FCC") -> str:
+def family_name(
+    v: Sequence[int], crystal_structure: str = "FCC",
+    crystal_model: CrystalModel | None = None,
+) -> str:
     structure = normalize_crystal_structure(crystal_structure)
     reduced = canonical_line(v)
-    for family in zone_families_for_structure(structure):
-        if reduced in family_directions(family, crystal_structure=structure):
+    for family in zone_families_for_structure(structure, crystal_model):
+        if reduced in family_directions(
+            family, crystal_structure=structure, crystal_model=crystal_model
+        ):
             return family
+    if crystal_model is not None:
+        if crystal_model.is_hexagonal:
+            return format_zone_direction(reduced, "HCP", True, brackets="<>")[1:-1]
+        return ",".join(str(value) for value in reduced)
     if structure == "HCP":
         return format_zone_direction(reduced, "HCP", True, brackets="<>")[1:-1]
     vals = sorted(abs(int(x)) for x in reduced)
@@ -522,7 +614,13 @@ def parse_hcp_family_base(family: str) -> tuple[int, int, int]:
 def parse_family_direction(
     family: str,
     crystal_structure: str = "FCC",
+    crystal_model: CrystalModel | None = None,
 ) -> tuple[int, int, int]:
+    if crystal_model is not None and not crystal_model.is_hexagonal:
+        try:
+            return parse_miller(family)
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError(f"Invalid custom zone direction {family!r}") from exc
     structure = normalize_crystal_structure(crystal_structure)
     if structure == "HCP":
         return parse_hcp_family_base(family)
@@ -533,9 +631,17 @@ def family_directions(
     family: str,
     include_opposites: bool = False,
     crystal_structure: str = "FCC",
+    crystal_model: CrystalModel | None = None,
 ) -> list[tuple[int, int, int]]:
     structure = normalize_crystal_structure(crystal_structure)
-    base = parse_family_direction(family, structure)
+    base = parse_family_direction(family, structure, crystal_model)
+
+    if crystal_model is not None:
+        lines = _custom_symmetry_orbit(base, crystal_model)
+        if include_opposites:
+            return sorted({direction for line in lines for direction in
+                           (line, tuple(-value for value in line))})
+        return list(lines)
 
     dirs: set[tuple[int, int, int]] = set()
     if structure == "HCP":
@@ -579,7 +685,10 @@ def reflection_allowed(
     h: int,
     k: int,
     l: int,
+    crystal_model: CrystalModel | None = None,
 ) -> bool:
+    if crystal_model is not None:
+        return _custom_reflection_allowed(crystal_model, h, k, l)
     structure = normalize_crystal_structure(crystal_structure)
     if structure == "FCC":
         return fcc_allowed(h, k, l)
@@ -588,6 +697,18 @@ def reflection_allowed(
     phase_cycles = (2.0 * h + k) / 3.0 + l / 2.0
     structure_factor = 1.0 + np.exp(2j * math.pi * phase_cycles)
     return abs(structure_factor) > 1e-8
+
+
+@lru_cache(maxsize=131072)
+def _custom_reflection_allowed(
+    crystal_model: CrystalModel, h: int, k: int, l: int
+) -> bool:
+    # Kinematic structure-factor extinction. Atomic-number/occupancy weights
+    # are a fast electron-scattering proxy, not a quantitative intensity model.
+    sites = np.asarray(crystal_model.sites, dtype=float)
+    phase = 2.0j * math.pi * (sites[:, :3] @ np.asarray((h, k, l)))
+    amplitude = abs(np.sum(sites[:, 3] * np.exp(phase)))
+    return bool(amplitude > 1e-6 * float(np.sum(sites[:, 3])))
 
 
 def perpendicular_basis(zone: Sequence[int]) -> tuple[Array, Array]:
@@ -606,11 +727,15 @@ def make_reflections(
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A,
     max_index: int = DEFAULT_REFLECTION_MAX_INDEX,
     max_g_norm: float = DEFAULT_REFLECTION_MAX_G_NORM,
+    crystal_model: CrystalModel | None = None,
 ) -> tuple[list[Reflection], Array, Array]:
     structure = normalize_crystal_structure(crystal_structure)
     z = np.asarray(reduce_miller(zone), dtype=int)
-    zone_cart = direction_cartesian(z, structure, hcp_c_over_a)
+    zone_cart = direction_cartesian(z, structure, hcp_c_over_a, crystal_model)
     bx, by = perpendicular_basis(zone_cart)
+    reciprocal_basis = reciprocal_lattice_matrix(
+        structure, hcp_c_over_a, crystal_model
+    )
     reflections: list[Reflection] = [
         Reflection(0, 0, 0, (0.0, 0.0), 0.0)
     ]
@@ -621,9 +746,9 @@ def make_reflections(
                     continue
                 if h * z[0] + k * z[1] + l * z[2] != 0:
                     continue
-                if not reflection_allowed(structure, h, k, l):
+                if not reflection_allowed(structure, h, k, l, crystal_model):
                     continue
-                g = reciprocal_cartesian((h, k, l), structure, hcp_c_over_a)
+                g = reciprocal_basis @ np.asarray((h, k, l), dtype=float)
                 g_norm = float(np.linalg.norm(g))
                 if g_norm > max_g_norm:
                     continue
@@ -713,10 +838,18 @@ def nms_from_smoothed(
     n_peaks: int,
     min_distance_px: float,
     candidate_multiplier: int = 1200,
+    local_maxima_first: bool = False,
 ) -> list[Peak]:
     flat = smoothed.ravel()
     threshold = float(np.percentile(flat, percentile))
-    idx = np.flatnonzero(flat >= threshold)
+    if local_maxima_first:
+        # Broad, saturated matrix spots can occupy thousands of high-valued
+        # pixels. Rank distinct local maxima before limiting candidates so
+        # weaker precipitate reflections are not crowded out by those pixels.
+        neighborhood = ndi.maximum_filter(smoothed, size=3, mode="nearest")
+        idx = np.flatnonzero((smoothed >= threshold) & (smoothed == neighborhood))
+    else:
+        idx = np.flatnonzero(flat >= threshold)
     if idx.size == 0:
         return []
 
@@ -753,6 +886,7 @@ def detect_spots(
     min_distance_px: float | None = None,
     spot_sigma_px: float | None = None,
     peak_percentile: float = 99.0,
+    local_maxima_first: bool = False,
 ) -> list[Peak]:
     h, w = gray.shape
     min_dim = min(h, w)
@@ -762,9 +896,15 @@ def detect_spots(
         min_distance_px = max(10.0, min_dim / 28.0)
 
     smoothed = ndi.gaussian_filter(gray, spot_sigma_px)
-    peaks = nms_from_smoothed(smoothed, peak_percentile, n_peaks, min_distance_px)
+    peaks = nms_from_smoothed(
+        smoothed, peak_percentile, n_peaks, min_distance_px,
+        local_maxima_first=local_maxima_first,
+    )
     if len(peaks) < 8 and peak_percentile > 95.0:
-        peaks = nms_from_smoothed(smoothed, 95.0, n_peaks, min_distance_px)
+        peaks = nms_from_smoothed(
+            smoothed, 95.0, n_peaks, min_distance_px,
+            local_maxima_first=local_maxima_first,
+        )
     return peaks
 
 
@@ -812,6 +952,40 @@ def fit_similarity(model_xy: Array, obs_xy: Array) -> tuple[Array, float, Array]
     return rot, scale, translation
 
 
+@dataclass(frozen=True)
+class _ScoringContext:
+    """Arrays and search structures shared by every pose of one pattern."""
+
+    model_xy: Array
+    peak_tree: cKDTree
+    min_shell: float
+    low_order_mask: Array
+
+
+def _make_scoring_context(
+    reflections: Sequence[Reflection], peaks_screen: Array
+) -> _ScoringContext:
+    model_xy = np.asarray([reflection.xy for reflection in reflections], dtype=float)
+    min_shell = min(
+        (reflection.g_norm for reflection in reflections if reflection.g_norm > 0),
+        default=1.0,
+    )
+    low_order_limit = 2.01 * min_shell
+    low_order_mask = np.asarray(
+        [
+            0.0 < reflection.g_norm <= low_order_limit
+            for reflection in reflections
+        ],
+        dtype=bool,
+    )
+    return _ScoringContext(
+        model_xy=model_xy,
+        peak_tree=cKDTree(peaks_screen),
+        min_shell=min_shell,
+        low_order_mask=low_order_mask,
+    )
+
+
 def score_transform(
     reflections: Sequence[Reflection],
     peaks_screen: Array,
@@ -820,19 +994,19 @@ def score_transform(
     translation: Array,
     image_size: tuple[int, int],
     tolerance_fraction: float,
+    _context: _ScoringContext | None = None,
 ) -> tuple[float, dict[int, int], list[int], float, float]:
     width, height = image_size
-    model_xy = np.asarray([r.xy for r in reflections], dtype=float)
+    context = _context or _make_scoring_context(reflections, peaks_screen)
+    model_xy = context.model_xy
     pred = apply_transform(model_xy, scale * linear_unit, translation)
     vis = visible_mask(pred, width, height)
     visible_indices = [int(i) for i in np.flatnonzero(vis)]
     if not visible_indices:
         return -1e9, {}, [], float("inf"), 0.0
 
-    min_shell = min((r.g_norm for r in reflections if r.g_norm > 0), default=1.0)
-    tolerance_px = max(10.0, tolerance_fraction * scale * min_shell)
-    tree = cKDTree(peaks_screen)
-    dists, obs_indices = tree.query(pred[vis], k=1)
+    tolerance_px = max(10.0, tolerance_fraction * scale * context.min_shell)
+    dists, obs_indices = context.peak_tree.query(pred[vis], k=1)
 
     candidates: list[tuple[float, int, int]] = []
     for ref_idx, dist, obs_idx in zip(visible_indices, dists, obs_indices):
@@ -875,18 +1049,15 @@ def score_transform(
     # If high-order spots are observed, their visible low-order predecessors
     # should normally be present as well.  Restrict this term to the first two
     # reciprocal shells so weak high-order reflections remain optional.
-    low_order_limit = 2.01 * min_shell
-    low_order_visible = [
-        ref_idx
-        for ref_idx in visible_indices
-        if 0.0 < reflections[ref_idx].g_norm <= low_order_limit
-    ]
+    low_order_visible_count = int(
+        np.count_nonzero(context.low_order_mask[visible_indices])
+    )
     low_order_matched_count = sum(
-        ref_idx in matched for ref_idx in low_order_visible
+        bool(context.low_order_mask[ref_idx]) for ref_idx in matched
     )
     low_order_completeness = (
-        low_order_matched_count / len(low_order_visible)
-        if low_order_visible
+        low_order_matched_count / low_order_visible_count
+        if low_order_visible_count
         else 0.0
     )
     normalized_rms = rms / tolerance_px if distances else 999.0
@@ -909,8 +1080,10 @@ def refine_match(
     image_size: tuple[int, int],
     tolerance_fraction: float,
     iterations: int = 4,
+    _context: _ScoringContext | None = None,
 ) -> tuple[Array, float, Array, float, dict[int, int], list[int], float, float]:
-    model_xy = np.asarray([r.xy for r in reflections], dtype=float)
+    context = _context or _make_scoring_context(reflections, peaks_screen)
+    model_xy = context.model_xy
     best = score_transform(
         reflections,
         peaks_screen,
@@ -919,6 +1092,7 @@ def refine_match(
         translation,
         image_size,
         tolerance_fraction,
+        context,
     )
     best_score, best_matched, best_visible, best_rms, best_tol = best
     best_linear, best_scale, best_translation = linear_unit, scale, translation
@@ -940,6 +1114,7 @@ def refine_match(
             new_translation,
             image_size,
             tolerance_fraction,
+            context,
         )
         score, matched, visible, rms, tol = scored
         if score + 1e-9 < best_score:
@@ -977,6 +1152,8 @@ def match_pattern(
     crystal_structure: str = "FCC",
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A,
     hcp_four_index: bool = False,
+    crystal_model: CrystalModel | None = None,
+    scale_hypotheses: list[PatternMatch] | None = None,
 ) -> PatternMatch | None:
     structure = normalize_crystal_structure(crystal_structure)
     reflections, bx, by = make_reflections(
@@ -985,11 +1162,13 @@ def match_pattern(
         hcp_c_over_a=hcp_c_over_a,
         max_index=max_index,
         max_g_norm=max_g_norm,
+        crystal_model=crystal_model,
     )
     model_xy = np.asarray([r.xy for r in reflections], dtype=float)
     peaks_screen = as_screen_points(peaks)
     if len(peaks_screen) < 4:
         return None
+    scoring_context = _make_scoring_context(reflections, peaks_screen)
 
     if center_xy is None:
         width, height = image_size
@@ -1037,6 +1216,7 @@ def match_pattern(
                 translation,
                 image_size,
                 tolerance_fraction,
+                _context=scoring_context,
             )
             (
                 unit,
@@ -1054,7 +1234,9 @@ def match_pattern(
                 crystal_structure=structure,
                 hcp_c_over_a=hcp_c_over_a,
                 hcp_four_index=hcp_four_index,
-                zone_cartesian=direction_cartesian(zone, structure, hcp_c_over_a),
+                zone_cartesian=direction_cartesian(
+                    zone, structure, hcp_c_over_a, crystal_model
+                ),
                 basis_x=bx,
                 basis_y=by,
                 reflections=reflections,
@@ -1066,9 +1248,29 @@ def match_pattern(
                 rms_px=rms,
                 tolerance_px=tol,
                 score=score,
+                crystal_model=crystal_model,
             )
             if best is None or result.score > best.score:
                 best = result
+            if scale_hypotheses is not None:
+                # Retain separately fitted spacings for the same zone. A
+                # secondary-phase superlattice can otherwise win by a tiny
+                # margin at half the true matrix scale; calibration applied
+                # after this function cannot recover a discarded pose.
+                nearby = next(
+                    (
+                        index for index, earlier in enumerate(scale_hypotheses)
+                        if abs(math.log(result.scale / earlier.scale)) < 0.06
+                    ),
+                    None,
+                )
+                if nearby is None:
+                    scale_hypotheses.append(result)
+                elif result.score > scale_hypotheses[nearby].score:
+                    scale_hypotheses[nearby] = result
+                if len(scale_hypotheses) > 12:
+                    scale_hypotheses.sort(key=lambda item: item.score, reverse=True)
+                    del scale_hypotheses[12:]
 
     return best
 
@@ -1084,15 +1286,16 @@ def choose_best_match(
     crystal_structure: str = "FCC",
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A,
     hcp_four_index: bool = False,
+    crystal_model: CrystalModel | None = None,
 ) -> tuple[PatternMatch, list[PatternMatch]]:
     structure = normalize_crystal_structure(crystal_structure)
     candidates: list[tuple[str, tuple[int, int, int]]] = []
     if current_zone is not None:
-        candidates.append((family_name(current_zone, structure), current_zone))
+        candidates.append((family_name(current_zone, structure, crystal_model), current_zone))
     else:
         candidates.extend(
-            (family, parse_family_direction(family, structure))
-            for family in zone_families_for_structure(structure)
+            (family, parse_family_direction(family, structure, crystal_model))
+            for family in zone_families_for_structure(structure, crystal_model)
         )
 
     results: list[PatternMatch] = []
@@ -1109,6 +1312,7 @@ def choose_best_match(
             crystal_structure=structure,
             hcp_c_over_a=hcp_c_over_a,
             hcp_four_index=hcp_four_index,
+            crystal_model=crystal_model,
         )
         if result is not None:
             results.append(result)
@@ -1134,6 +1338,79 @@ def match_ambiguity(
         AMBIGUITY_RELATIVE_SCORE_GAP * abs(first_score),
     )
     return score_gap < required_gap, score_gap, required_gap
+
+
+def select_fcc_scale_hypothesis(
+    match: PatternMatch,
+    peaks: Sequence[Peak],
+    image_size: tuple[int, int],
+    center_xy: tuple[float, float] | None,
+    max_index: int,
+    max_g_norm: float,
+    tolerance_fraction: float,
+    scale_bar_pixels: float | None,
+    scale_bar_value_inv_nm: float | None,
+    expected_lattice_parameter_nm: float | None,
+) -> PatternMatch:
+    """Keep a matrix fit from losing to a nearly tied half-scale alias.
+
+    Different phase spots can make one FCC zone fit at approximately half its
+    true reciprocal scale.  The standard matcher keeps only its highest-score
+    pose, so a later lattice calibration cannot recover the discarded fit.
+    Refit only the current FCC candidate and compare its distinct scale poses.
+    """
+    variants: list[PatternMatch] = []
+    match_pattern(
+        match.family,
+        match.zone,
+        peaks,
+        image_size,
+        center_xy,
+        max_index,
+        max_g_norm,
+        tolerance_fraction,
+        crystal_structure="FCC",
+        scale_hypotheses=variants,
+    )
+    if not variants:
+        return match
+
+    calibrated = all(
+        value is not None and value > 0
+        for value in (
+            scale_bar_pixels,
+            scale_bar_value_inv_nm,
+            expected_lattice_parameter_nm,
+        )
+    )
+    if calibrated:
+        assert scale_bar_pixels is not None
+        assert scale_bar_value_inv_nm is not None
+        assert expected_lattice_parameter_nm is not None
+        expected_scale = scale_bar_pixels / (
+            scale_bar_value_inv_nm * expected_lattice_parameter_nm
+        )
+        sigma_log = math.log1p(LATTICE_CALIBRATION_RELATIVE_SIGMA)
+
+        def calibrated_score(candidate: PatternMatch) -> float:
+            z_score = math.log(candidate.scale / expected_scale) / sigma_log
+            return candidate.score - 0.5 * z_score * z_score
+
+        return max(variants, key=calibrated_score)
+
+    # Without a physical scale, intervene only for the unmistakable octave
+    # alias: practically the same fit angle/center and score, but twice the
+    # reciprocal scale.  Other candidate rankings remain untouched.
+    tied_primitive = [
+        candidate
+        for candidate in variants
+        if 1.85 <= candidate.scale / match.scale <= 2.15
+        and candidate.score >= match.score - 0.1
+        and abs((candidate.angle_deg - match.angle_deg + 90.0) % 180.0 - 90.0) <= 5.0
+        and float(np.linalg.norm(candidate.translation - match.translation))
+        <= 0.02 * min(image_size)
+    ]
+    return max(tied_primitive, key=lambda candidate: candidate.score) if tied_primitive else match
 
 
 def apply_lattice_calibration(
@@ -1192,14 +1469,18 @@ def index_diffraction_pattern(
     crystal_structure: str = "FCC",
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A,
     hcp_four_index: bool = False,
+    crystal_model: CrystalModel | None = None,
 ) -> IndexingResult:
     structure = normalize_crystal_structure(crystal_structure)
+    if crystal_model is not None and expected_lattice_parameter_nm is None:
+        expected_lattice_parameter_nm = crystal_model.a_nm
     peaks = detect_spots(
         gray,
         n_peaks=n_peaks,
         min_distance_px=min_distance_px,
         spot_sigma_px=spot_sigma_px,
         peak_percentile=peak_percentile,
+        local_maxima_first=crystal_model is not None,
     )
     if len(peaks) < 4:
         raise RuntimeError("Too few diffraction spots were detected. Try lowering the peak percentile.")
@@ -1215,20 +1496,37 @@ def index_diffraction_pattern(
         crystal_structure=structure,
         hcp_c_over_a=hcp_c_over_a,
         hcp_four_index=hcp_four_index,
+        crystal_model=crystal_model,
     )
     initial_peak_count = len(peaks)
     initial_best_family = best.family
     ambiguous, score_gap, required_gap = match_ambiguity(matches)
     adaptive_used = False
+    harmonic_alias_scale: float | None = None
 
     adaptive_n_peaks = max(
         n_peaks,
         min(ADAPTIVE_MAX_PEAKS, max(ADAPTIVE_MIN_PEAKS, 2 * n_peaks)),
     )
-    adaptive_percentile = min(ADAPTIVE_PEAK_PERCENTILE, peak_percentile)
+    adaptive_percentile = min(
+        CUSTOM_ADAPTIVE_PEAK_PERCENTILE
+        if crystal_model is not None
+        else ADAPTIVE_PEAK_PERCENTILE,
+        peak_percentile,
+    )
+    custom_sparse = crystal_model is not None and len(peaks) < max(
+        50, int(0.7 * n_peaks)
+    )
+    initial_observed_coverage = best.matched_count / len(peaks)
+    strong_initial_custom_match = bool(
+        crystal_model is not None
+        and best.matched_count >= CUSTOM_STRONG_INITIAL_MIN_MATCHES
+        and initial_observed_coverage >= CUSTOM_STRONG_INITIAL_COVERAGE
+        and not ambiguous
+        and score_gap >= CUSTOM_STRONG_INITIAL_GAP_FACTOR * required_gap
+    )
     should_try_adaptive = (
-        current_zone is None
-        and ambiguous
+        (custom_sparse or (current_zone is None and ambiguous))
         and (
             adaptive_n_peaks != n_peaks
             or abs(adaptive_percentile - peak_percentile) > 1e-9
@@ -1241,12 +1539,25 @@ def index_diffraction_pattern(
             min_distance_px=min_distance_px,
             spot_sigma_px=spot_sigma_px,
             peak_percentile=adaptive_percentile,
+            local_maxima_first=crystal_model is not None,
         )
         if len(adaptive_peaks) > len(peaks):
+            # A decisive custom-CIF first pass has already selected the zone
+            # family.  Refit that family against the additional weak spots so
+            # its scale/rotation remains accurate, but do not repeat the
+            # expensive exhaustive scan of every custom family.  Weak or
+            # ambiguous custom fits still receive the full adaptive search.
+            adaptive_current_zone = current_zone
+            if (
+                crystal_model is not None
+                and current_zone is None
+                and strong_initial_custom_match
+            ):
+                adaptive_current_zone = best.zone
             adaptive_best, adaptive_matches = choose_best_match(
                 adaptive_peaks,
                 image_size,
-                current_zone=None,
+                current_zone=adaptive_current_zone,
                 center_xy=center_xy,
                 max_index=max_index,
                 max_g_norm=max_g_norm,
@@ -1254,17 +1565,24 @@ def index_diffraction_pattern(
                 crystal_structure=structure,
                 hcp_c_over_a=hcp_c_over_a,
                 hcp_four_index=hcp_four_index,
+                crystal_model=crystal_model,
             )
             adaptive_ambiguous, adaptive_gap, adaptive_required = match_ambiguity(
                 adaptive_matches
             )
-            stronger_evidence = (
-                adaptive_best.matched_count > best.matched_count
-                and (
-                    not adaptive_ambiguous
-                    or adaptive_gap > score_gap
+            if crystal_model is not None:
+                # The additional maxima must explain appreciably more observed
+                # spots; otherwise a lower threshold can reward noise.
+                stronger_evidence = (
+                    adaptive_best.matched_count >= best.matched_count + max(3, int(0.15 * best.matched_count))
+                    and adaptive_best.score > best.score + 2.0
+                    and (current_zone is not None or not adaptive_ambiguous or adaptive_gap > score_gap)
                 )
-            )
+            else:
+                stronger_evidence = (
+                    adaptive_best.matched_count > best.matched_count
+                    and (not adaptive_ambiguous or adaptive_gap > score_gap)
+                )
             if stronger_evidence:
                 peaks = adaptive_peaks
                 best = adaptive_best
@@ -1273,6 +1591,40 @@ def index_diffraction_pattern(
                 score_gap = adaptive_gap
                 required_gap = adaptive_required
                 adaptive_used = True
+
+    if crystal_model is None and structure == "FCC":
+        calibration_available = all(
+            value is not None and value > 0
+            for value in (
+                scale_bar_pixels,
+                scale_bar_value_inv_nm,
+                expected_lattice_parameter_nm,
+            )
+        )
+        # Calibration is especially useful for alternatives within the same
+        # zone family, not just for choosing between different families.
+        # Without it, examine only the winning family for a near-exact octave
+        # alias; the standard FCC/BCC/HCP scoring remains otherwise intact.
+        candidates_to_check = list(enumerate(matches[:3] if calibration_available else matches[:1]))
+        for index, original in candidates_to_check:
+            resolved = select_fcc_scale_hypothesis(
+                original,
+                peaks,
+                image_size,
+                center_xy,
+                max_index,
+                max_g_norm,
+                tolerance_fraction,
+                scale_bar_pixels,
+                scale_bar_value_inv_nm,
+                expected_lattice_parameter_nm,
+            )
+            if resolved is not original:
+                if not calibration_available and index == 0:
+                    harmonic_alias_scale = original.scale
+                matches[index] = resolved
+        matches.sort(key=lambda candidate: candidate.score, reverse=True)
+        best = matches[0]
 
     matches = apply_lattice_calibration(
         matches,
@@ -1297,6 +1649,7 @@ def index_diffraction_pattern(
         ambiguous=ambiguous,
         scale_bar_pixels=scale_bar_pixels,
         calibration_used=calibration_used,
+        harmonic_alias_scale=harmonic_alias_scale,
     )
     return IndexingResult(
         peaks=peaks,
@@ -1418,11 +1771,13 @@ def target_rows(
             family,
             include_opposites=include_opposites,
             crystal_structure=match.crystal_structure,
+            crystal_model=match.crystal_model,
         ):
             target_indices = np.asarray(line_direction, dtype=int)
             target = normalize(
                 direction_cartesian(
-                    target_indices, match.crystal_structure, match.hcp_c_over_a
+                    target_indices, match.crystal_structure, match.hcp_c_over_a,
+                    match.crystal_model,
                 )
             )
             if not include_opposites and float(np.dot(target, current)) < 0:
@@ -1441,7 +1796,8 @@ def target_rows(
             rows.append(
                 {
                     "family": format_zone_family(
-                        family, match.crystal_structure, match.hcp_four_index
+                        family, match.crystal_structure, match.hcp_four_index,
+                        match.crystal_model,
                     ),
                     "family_key": family,
                     "zone": format_zone_direction(
@@ -1624,11 +1980,13 @@ def in_plane_rotation_rows(
             family,
             include_opposites=include_opposites,
             crystal_structure=match.crystal_structure,
+            crystal_model=match.crystal_model,
         ):
             target_indices = np.asarray(line_direction, dtype=int)
             target = normalize(
                 direction_cartesian(
-                    target_indices, match.crystal_structure, match.hcp_c_over_a
+                    target_indices, match.crystal_structure, match.hcp_c_over_a,
+                    match.crystal_model,
                 )
             )
             if not include_opposites and float(np.dot(target, current)) < 0:
@@ -1658,7 +2016,8 @@ def in_plane_rotation_rows(
                     {
                         "ok": "yes",
                         "family": format_zone_family(
-                            family, match.crystal_structure, match.hcp_four_index
+                            family, match.crystal_structure, match.hcp_four_index,
+                            match.crystal_model,
                         ),
                         "family_key": family,
                         "zone": format_zone_direction(
@@ -1709,11 +2068,13 @@ def sample_rotation_reachable_rows(
             family,
             include_opposites=include_opposites,
             crystal_structure=match.crystal_structure,
+            crystal_model=match.crystal_model,
         ):
             target_indices = np.asarray(line_direction, dtype=int)
             target = normalize(
                 direction_cartesian(
-                    target_indices, match.crystal_structure, match.hcp_c_over_a
+                    target_indices, match.crystal_structure, match.hcp_c_over_a,
+                    match.crystal_model,
                 )
             )
             if not include_opposites and float(np.dot(target, current)) < 0:
@@ -1734,7 +2095,8 @@ def sample_rotation_reachable_rows(
             rows.append(
                 {
                     "family": format_zone_family(
-                        family, match.crystal_structure, match.hcp_four_index
+                        family, match.crystal_structure, match.hcp_four_index,
+                        match.crystal_model,
                     ),
                     "family_key": family,
                     "zone": format_zone_direction(
@@ -1778,11 +2140,13 @@ def sample_rotation_map_points(
             family,
             include_opposites=include_opposites,
             crystal_structure=match.crystal_structure,
+            crystal_model=match.crystal_model,
         ):
             target_indices = np.asarray(line_direction, dtype=int)
             target = normalize(
                 direction_cartesian(
-                    target_indices, match.crystal_structure, match.hcp_c_over_a
+                    target_indices, match.crystal_structure, match.hcp_c_over_a,
+                    match.crystal_model,
                 )
             )
             if not include_opposites and float(np.dot(target, current)) < 0:
@@ -1806,6 +2170,7 @@ def sample_rotation_map_points(
                     crystal_structure=match.crystal_structure,
                     hcp_four_index=match.hcp_four_index,
                     hcp_c_over_a=match.hcp_c_over_a,
+                    crystal_model=match.crystal_model,
                 )
             )
 
@@ -1834,7 +2199,9 @@ def zone_axis_map_points(
     current = normalize(np.asarray(match.zone_cartesian, dtype=float))
     points = [
         ZoneAxisMapPoint(
-            family=family_name(current_indices, match.crystal_structure),
+            family=family_name(
+                current_indices, match.crystal_structure, match.crystal_model
+            ),
             zone=current_indices,
             alpha_deg=alpha_deg,
             beta_deg=beta_deg,
@@ -1846,6 +2213,7 @@ def zone_axis_map_points(
             crystal_structure=match.crystal_structure,
             hcp_four_index=match.hcp_four_index,
             hcp_c_over_a=match.hcp_c_over_a,
+            crystal_model=match.crystal_model,
         )
     ]
 
@@ -1855,11 +2223,13 @@ def zone_axis_map_points(
             family,
             include_opposites=False,
             crystal_structure=match.crystal_structure,
+            crystal_model=match.crystal_model,
         ):
             target_indices = np.asarray(line_direction, dtype=int)
             target = normalize(
                 direction_cartesian(
-                    target_indices, match.crystal_structure, match.hcp_c_over_a
+                    target_indices, match.crystal_structure, match.hcp_c_over_a,
+                    match.crystal_model,
                 )
             )
             if float(np.dot(target, current)) < 0:
@@ -1886,6 +2256,7 @@ def zone_axis_map_points(
                     crystal_structure=match.crystal_structure,
                     hcp_four_index=match.hcp_four_index,
                     hcp_c_over_a=match.hcp_c_over_a,
+                    crystal_model=match.crystal_model,
                 )
             )
 
@@ -1900,9 +2271,10 @@ def zone_axis_reachable_with_sample_rotation(
     beta_limits: tuple[float, float],
     crystal_structure: str = "FCC",
     hcp_c_over_a: float = DEFAULT_HCP_C_OVER_A,
+    crystal_model: CrystalModel | None = None,
 ) -> bool:
     v_zero = crystal_to_zero_holder @ normalize(
-        direction_cartesian(zone, crystal_structure, hcp_c_over_a)
+        direction_cartesian(zone, crystal_structure, hcp_c_over_a, crystal_model)
     )
     return bool(sample_rotation_ranges_for_target(v_zero, holder_order, alpha_limits, beta_limits))
 
@@ -1929,6 +2301,7 @@ def filter_reachable_zone_axis_map_points(
                 beta_limits,
                 point.crystal_structure,
                 point.hcp_c_over_a,
+                point.crystal_model,
             )
         if reachable_cache[point.zone]:
             reachable.append(point)
@@ -2042,6 +2415,120 @@ def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -
     return int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
 
 
+def _miller_label_size(
+    draw: ImageDraw.ImageDraw,
+    indices: Sequence[int],
+    font: ImageFont.ImageFont,
+) -> tuple[int, int]:
+    sizes = [
+        text_size(draw, str(abs(int(value))), font)
+        for value in indices
+    ]
+    width = sum(token_width for token_width, _token_height in sizes)
+    height = max((token_height for _token_width, token_height in sizes), default=0)
+    # Negative indices add an overbar just above the glyph box.
+    if any(int(value) < 0 for value in indices):
+        height += max(2, height // 8)
+    return width, height
+
+
+def _adaptive_miller_label_font_size(
+    draw: ImageDraw.ImageDraw,
+    match: PatternMatch,
+    pred_screen: Array,
+    label_indices: Sequence[int],
+    image_size: tuple[int, int],
+) -> int:
+    """Choose the largest readable label font that fits the local spot spacing."""
+    min_dim = min(image_size)
+    legacy_size = max(24, int(min_dim / 48))
+    if len(label_indices) < 2:
+        return legacy_size
+
+    points = np.asarray(
+        [
+            (float(pred_screen[index, 0]), float(-pred_screen[index, 1]))
+            for index in label_indices
+        ],
+        dtype=float,
+    )
+    nearest = cKDTree(points).query(points, k=2)[0][:, 1]
+    nearest = nearest[np.isfinite(nearest)]
+    if not len(nearest):
+        return legacy_size
+    local_spacing = float(np.percentile(nearest, 25.0))
+    minimum_size = min(legacy_size, max(8, int(round(min_dim / 100.0))))
+    if local_spacing <= 0:
+        return minimum_size
+
+    miller_indices = [
+        (
+            match.reflections[index].h,
+            match.reflections[index].k,
+            match.reflections[index].l,
+        )
+        for index in label_indices
+    ]
+
+    def layout_quantiles(size: int) -> tuple[float, float]:
+        font = load_label_font(size)
+        dimensions = [
+            _miller_label_size(draw, indices, font)
+            for indices in miller_indices
+        ]
+        widths = [width for width, _height in dimensions]
+        heights = [height for _width, height in dimensions]
+        return (
+            float(np.percentile(widths, 75.0)),
+            float(np.percentile(heights, 75.0)),
+        )
+
+    max_width = 1.35 * local_spacing
+    max_height = 0.75 * local_spacing
+    width, height = layout_quantiles(legacy_size)
+    if width <= max_width and height <= max_height:
+        return legacy_size
+
+    scale = min(
+        1.0,
+        max_width / max(width, 1.0),
+        max_height / max(height, 1.0),
+    )
+    candidate = max(minimum_size, min(legacy_size, int(legacy_size * scale)))
+    while candidate > minimum_size:
+        width, height = layout_quantiles(candidate)
+        if width <= max_width and height <= max_height:
+            return candidate
+        candidate -= 1
+    return minimum_size
+
+
+def _radial_miller_label_position(
+    point: tuple[float, float],
+    pattern_center: tuple[float, float],
+    label_size: tuple[int, int],
+    image_size: tuple[int, int],
+    spot_radius: int,
+    padding: int,
+) -> tuple[float, float]:
+    """Place a dense-pattern label outward from the direct-beam position."""
+    vector = np.asarray(point, dtype=float) - np.asarray(pattern_center, dtype=float)
+    norm = float(np.linalg.norm(vector))
+    direction = vector / norm if norm > 1e-9 else np.array((0.0, -1.0))
+    width, height = label_size
+    support = 0.5 * (
+        abs(float(direction[0])) * width
+        + abs(float(direction[1])) * height
+    )
+    distance = spot_radius + padding + support
+    position = np.asarray(point, dtype=float) + direction * distance
+    half_width = width / 2.0
+    half_height = height / 2.0
+    position[0] = np.clip(position[0], half_width + 2, image_size[0] - half_width - 2)
+    position[1] = np.clip(position[1], half_height + 3, image_size[1] - half_height - 2)
+    return float(position[0]), float(position[1])
+
+
 def draw_miller_label(
     draw: ImageDraw.ImageDraw,
     position: tuple[float, float],
@@ -2090,32 +2577,75 @@ def draw_predicted_spots_and_labels(
     spot_fill: tuple[int, int, int] = (245, 145, 190),
     spot_outline: tuple[int, int, int] = (255, 230, 245),
     label_fill: tuple[int, int, int] = (245, 245, 245),
+    highlight_matched_only: bool = False,
 ) -> None:
     min_dim = min(image_size)
     if spot_radius is None:
         spot_radius = max(5, int(min_dim / 210))
-    font = load_label_font(max(24, int(min_dim / 48)))
-    label_offset = max(18, int(min_dim / 55))
     vis = visible_mask(pred_screen, image_size[0], image_size[1], margin=60.0)
+    label_indices = [
+        int(index)
+        for index in np.flatnonzero(vis)
+        if not highlight_matched_only or int(index) in match.matched_indices
+    ]
+    legacy_font_size = max(24, int(min_dim / 48))
+    font_size = _adaptive_miller_label_font_size(
+        draw, match, pred_screen, label_indices, image_size
+    )
+    font = load_label_font(font_size)
+    dense_layout = font_size < legacy_font_size
+    label_offset = max(18, int(min_dim / 55))
+    origin_index = next(
+        (
+            index
+            for index, reflection in enumerate(match.reflections)
+            if reflection.h == reflection.k == reflection.l == 0
+        ),
+        None,
+    )
+    pattern_center = (
+        (
+            float(pred_screen[origin_index, 0]),
+            float(-pred_screen[origin_index, 1]),
+        )
+        if origin_index is not None
+        else (float(match.translation[0]), float(-match.translation[1]))
+    )
 
     for idx in np.flatnonzero(vis):
+        matched = int(idx) in match.matched_indices
+        radius = spot_radius if (not highlight_matched_only or matched) else max(2, spot_radius // 2)
+        fill = spot_fill if (not highlight_matched_only or matched) else (90, 90, 90)
+        outline = spot_outline if (not highlight_matched_only or matched) else (130, 130, 130)
         x = float(pred_screen[int(idx), 0])
         y = float(-pred_screen[int(idx), 1])
         draw.ellipse(
-            (x - spot_radius, y - spot_radius, x + spot_radius, y + spot_radius),
-            fill=spot_fill,
-            outline=spot_outline,
-            width=max(1, spot_radius // 3),
+            (x - radius, y - radius, x + radius, y + radius),
+            fill=fill,
+            outline=outline,
+            width=max(1, radius // 3),
         )
 
     if not show_labels:
         return
 
-    for idx in np.flatnonzero(vis):
+    for idx in label_indices:
         r = match.reflections[int(idx)]
         x = float(pred_screen[int(idx), 0])
-        y = float(-pred_screen[int(idx), 1]) - label_offset
-        draw_miller_label(draw, (x, y), (r.h, r.k, r.l), font, fill=label_fill)
+        y = float(-pred_screen[int(idx), 1])
+        indices = (r.h, r.k, r.l)
+        if dense_layout:
+            position = _radial_miller_label_position(
+                (x, y),
+                pattern_center,
+                _miller_label_size(draw, indices, font),
+                image_size,
+                spot_radius,
+                padding=max(2, font_size // 6),
+            )
+        else:
+            position = (x, y - label_offset)
+        draw_miller_label(draw, position, indices, font, fill=label_fill)
 
 
 def predicted_pattern_image(
@@ -2156,6 +2686,7 @@ def fitted_diffraction_image(
     draw_guides: bool = True,
     kikuchi_max_g_norm: float = 0.0,
     title: str | None = None,
+    highlight_matched_only: bool | None = None,
 ) -> Image.Image:
     out = image.copy().convert("RGB")
     draw = ImageDraw.Draw(out)
@@ -2180,6 +2711,13 @@ def fitted_diffraction_image(
         spot_fill=(255, 120, 190),
         spot_outline=(255, 245, 255),
         label_fill=(255, 120, 190),
+        # CIF cells permit many very weak superlattice reflections. Keep the
+        # unmatched predictions visible but do not present all of them as
+        # equally strong indexed experimental spots.
+        highlight_matched_only=(
+            match.crystal_model is not None
+            if highlight_matched_only is None else highlight_matched_only
+        ),
     )
     if title:
         draw.rectangle((8, 8, 24 + 11 * len(title), 42), fill=(0, 0, 0))
@@ -2687,16 +3225,25 @@ def print_match_summary(
 ) -> None:
     print("\nBest present-zone match")
     print("-----------------------")
-    print(f"crystal structure : {best.crystal_structure}")
+    print(
+        "crystal structure : "
+        + (best.crystal_model.name if best.crystal_model is not None else best.crystal_structure)
+    )
     print(
         "zone family       : "
-        f"{format_zone_family(best.family, best.crystal_structure, best.hcp_four_index)}"
+        f"{format_zone_family(best.family, best.crystal_structure, best.hcp_four_index, best.crystal_model)}"
     )
     print(
         "indexed zone      : "
         f"{format_zone_direction(best.zone, best.crystal_structure, best.hcp_four_index)}"
     )
     print(f"in-plane rotation : {best.angle_deg:.3f} deg")
+    if best.crystal_model is not None:
+        # The fitted matrix uses Cartesian +y upward. Image viewers use +y
+        # downward, and a diffraction line cannot distinguish 180-degree
+        # reversals, so report that more directly observable orientation too.
+        image_line_angle = (-best.angle_deg + 90.0) % 180.0 - 90.0
+        print(f"image-line angle  : {image_line_angle:.3f} deg (mod 180; image +y downward)")
     print(f"spot match        : {best.matched_count}/{best.visible_count} visible spots")
     print(f"RMS fit error     : {best.rms_px:.2f} px (tolerance {best.tolerance_px:.2f} px)")
     print(f"pixel scale       : {best.scale:.3f} px per reciprocal-index unit")
@@ -2712,6 +3259,12 @@ def print_match_summary(
         )
     if diagnostics is not None and diagnostics.calibration_used:
         print("lattice calibration: used for candidate ranking")
+    if diagnostics is not None and diagnostics.harmonic_alias_scale is not None:
+        print(
+            "harmonic alias    : nearly tied half-scale fit at "
+            f"{diagnostics.harmonic_alias_scale:.2f} px/index was rejected; "
+            "confirm with a known lattice and printed scale bar if available"
+        )
     if diagnostics is not None and diagnostics.ambiguous:
         second = all_results[1]
         print(
@@ -2740,7 +3293,7 @@ def print_match_summary(
                 else ""
             )
             print(
-                f"{format_zone_family(result.family, result.crystal_structure, result.hcp_four_index)} "
+                f"{format_zone_family(result.family, result.crystal_structure, result.hcp_four_index, result.crystal_model)} "
                 f"{format_zone_direction(result.zone, result.crystal_structure, result.hcp_four_index):>12s}  "
                 f"{result.matched_count:2d}/{result.visible_count:<2d} spots  "
                 f"rms {result.rms_px:7.2f} px  score {result.score:7.2f}"
